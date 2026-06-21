@@ -392,6 +392,8 @@ export {
 	setSystemMode,
 	resetTradingHalt,
 	reconcileSchedulerJobs,
+	getAgentProviderHealth,
+	reconcileAgentProviders,
 	runSignalScanNow,
 	runExecutionScanNow,
 	reconcileExchangeNow,

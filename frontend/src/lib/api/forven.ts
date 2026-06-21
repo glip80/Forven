@@ -1084,6 +1084,25 @@ export async function reconcileSchedulerJobs(): Promise<SchedulerReconcileRespon
 	return fetchApi('/scheduler/reconcile', { method: 'POST' });
 }
 
+export interface AgentProviderWarning {
+	agent_id: string;
+	provider: string;
+	fallback: string | null;
+}
+
+export async function getAgentProviderHealth(): Promise<{ warnings: AgentProviderWarning[]; count: number }> {
+	return fetchApi('/agents/provider-health');
+}
+
+export async function reconcileAgentProviders(): Promise<{
+	updated: number;
+	provider: string | null;
+	model_id: string | null;
+	agents: string[];
+}> {
+	return fetchApi('/agents/reconcile-providers', { method: 'POST' });
+}
+
 export async function runSignalScanNow(): Promise<ManualScannerRunResponse> {
 	return fetchApi('/system/scanner/signal-run', { method: 'POST' });
 }

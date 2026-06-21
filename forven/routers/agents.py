@@ -28,6 +28,23 @@ def put_model_policy(body: core.ModelPolicyUpdateBody):
     return core.put_model_policy(body)
 
 
+@router.get("/api/agents/provider-health")
+def get_agent_provider_health():
+    """Enabled agents whose configured AI provider has no usable credentials."""
+    from forven.agents.provider_health import list_agent_provider_warnings
+
+    warnings = list_agent_provider_warnings()
+    return {"warnings": warnings, "count": len(warnings)}
+
+
+@router.post("/api/agents/reconcile-providers")
+def post_reconcile_agent_providers():
+    """Repoint credential-less agents to a configured provider (wizard/manual)."""
+    from forven.agents.provider_health import reconcile_agent_providers
+
+    return reconcile_agent_providers()
+
+
 @router.post("/api/agents/strategy-developers")
 def post_strategy_developer_agent(body: core.LegacyAgentCreateBody):
     return core.post_strategy_developer_agent(body)

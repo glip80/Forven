@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { wizardOpen, wizardStep, closeWizard, clearWizardResume } from '$lib/stores/setupWizard';
-	import { getForvenAuthProviders, updateSettingsSection } from '$lib/api';
+	import { getForvenAuthProviders, reconcileAgentProviders, updateSettingsSection } from '$lib/api';
 	import { addToast } from '$lib/stores/processTracker';
 	import { pendingValues } from '$lib/settings/dirty';
 	import SettingsTrading from '$lib/components/settings/sections/SettingsTrading.svelte';
@@ -127,6 +127,14 @@
 				`You haven't finished: ${labels}. Forven won't run correctly until these are set up. Finish anyway?`
 			);
 			if (!ok) return;
+		}
+		// Make the provider the operator just connected the agents' default, so a
+		// fresh install isn't left with every agent pinned to the seed default
+		// (openai) it has no key for. Best-effort: agents also fall back at runtime.
+		try {
+			await reconcileAgentProviders();
+		} catch {
+			// Non-fatal — don't block finishing setup.
 		}
 		try {
 			await updateSettingsSection('ui', {
