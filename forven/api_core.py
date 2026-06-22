@@ -2743,6 +2743,22 @@ class SendToForgeBody(BaseModel):
     name: str | None = Field(default=None, max_length=140)
 
 
+class PreviewChartBody(BaseModel):
+    spec: dict  # rule-engine visual spec
+    symbol: str = "BTC"
+    timeframe: str = "1h"
+    start: str | None = None
+    end: str | None = None
+    trade_mode: str | None = None
+    name: str | None = Field(default=None, max_length=140)
+
+
+class NlToSpecBody(BaseModel):
+    description: str = Field(min_length=1, max_length=4000)
+    symbol: str = "BTC"
+    timeframe: str = "1h"
+
+
 class BacktestSubmitBody(BaseModel):
     strategy_id: str | None = Field(default=None, min_length=1, max_length=128)
     strategy_name: str | None = Field(default=None, max_length=256)
@@ -2803,6 +2819,33 @@ class ForceCloseTradeBody(BaseModel):
 
 class MarkTradeFailedBody(BaseModel):
     reason: str | None = Field(default=None, max_length=512)
+
+
+class PaperClosePositionBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=512)
+
+
+class PaperPartialCloseBody(BaseModel):
+    qty: float | None = Field(default=None, gt=0)
+    pct: float | None = Field(default=None, gt=0, le=100)
+
+
+class PaperOpenPositionBody(BaseModel):
+    direction: str = Field(..., pattern="^(?i)(long|short)$")
+    size: float | None = Field(default=None, gt=0)
+    risk_pct: float | None = Field(default=None, gt=0, le=100)
+    leverage: float = Field(default=1.0, gt=0, le=50)
+    stop_loss_price: float | None = Field(default=None, gt=0)
+    take_profit_price: float | None = Field(default=None, gt=0)
+
+
+class PaperAdjustLevelBody(BaseModel):
+    # null clears the level; a positive number sets it.
+    price: float | None = Field(default=None)
+
+
+class PaperAutoManagementBody(BaseModel):
+    paused: bool
 
 
 class LegacyAgentDocumentBody(BaseModel):
@@ -9206,6 +9249,46 @@ def post_backtest_preview(body: BacktestPreviewBody):
             "signal_density": "sparse", "warnings": warnings,
             "sample_entries": [], "sample_exits": [], "indicators": [],
         }
+
+
+def post_backtest_preview_chart(body: PreviewChartBody) -> dict:
+    """Live chart context (bars + indicator overlays + entry/exit markers) for a
+    no-code rule_engine spec — computed in-process, never persisted. Powers the
+    Strategy Creator's live preview chart. Never 500s; degrades to warnings."""
+    asset = _extract_base_asset_symbol(body.symbol)
+    timeframe = str(body.timeframe or "1h").strip() or "1h"
+    spec = body.spec if isinstance(body.spec, dict) else {}
+    try:
+        from forven.strategies.backtest import build_strategy_preview_chart_context
+
+        return build_strategy_preview_chart_context(
+            asset=asset,
+            timeframe=timeframe,
+            start_date=(str(body.start).strip() or None) if body.start else None,
+            end_date=(str(body.end).strip() or None) if body.end else None,
+            spec=spec,
+            trade_mode=str(body.trade_mode or "long_only").strip() or "long_only",
+            strategy_name=str(body.name or "Visual strategy"),
+        )
+    except Exception as exc:  # noqa: BLE001 — preview must never break the page
+        return {
+            "bars": [], "entry_markers": [], "exit_markers": [],
+            "main_indicators": [], "sub_indicators": [],
+            "strategy_name": str(body.name or "Visual strategy"),
+            "strategy_meta": "", "strategy_params": {"spec": spec},
+            "warnings": [f"Preview chart unavailable: {exc}"],
+        }
+
+
+async def post_nl_to_spec(body: NlToSpecBody) -> dict:
+    """Translate a natural-language strategy description into a rule_engine spec."""
+    from forven.strategies.nl_spec_gen import nl_to_rule_spec
+
+    return await nl_to_rule_spec(
+        description=body.description,
+        symbol=body.symbol,
+        timeframe=body.timeframe,
+    )
 
 
 _MANUAL_STRATEGY_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")

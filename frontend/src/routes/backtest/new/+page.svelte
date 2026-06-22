@@ -6,8 +6,6 @@
 		getPrebuiltStrategies,
 		submitBacktest,
 		previewSignals,
-		registerCustomStrategy,
-		sendStrategyToForge,
 		getResult,
 		getSymbols,
 		type Strategy,
@@ -21,9 +19,6 @@
 	import DateRangeFieldset from '$lib/components/ui/DateRangeFieldset.svelte';
 	import ParameterEditor from '$lib/components/ui/ParameterEditor.svelte';
 	import BacktestResultSummary from '$lib/components/backtest/BacktestResultSummary.svelte';
-	import RuleBuilder from '$lib/components/backtest/RuleBuilder.svelte';
-
-	const RULE_ENGINE_TYPE = 'rule_engine';
 
 	const BAR_CAP = 100_000;
 
@@ -37,98 +32,6 @@
 	let loadingStrategies = true;
 	let loadError = '';
 	let symbolSuggestions: string[] = [];
-
-	// Build mode: select a registered strategy, build visually, or write code.
-	let buildMode: 'select' | 'visual' | 'custom' = 'select';
-
-	// Visual (no-code) builder state.
-	let visualSpec: Record<string, unknown> = {};
-	let visualValid = false;
-	let visualErrors: string[] = [];
-	$: baseAsset = (symbol.split(/[\/\-:]/)[0] || symbol).trim().toUpperCase();
-
-	// In visual mode the trade direction is implied by which sides have entry
-	// conditions — otherwise short conditions are silently dropped (default
-	// long_only). In other modes the explicit Trade Direction selector wins.
-	function deriveVisualTradeMode(spec: Record<string, unknown>): 'long_only' | 'short_only' | 'both' {
-		const g = (k: string) => (spec?.[k] as { conditions?: unknown[] } | null | undefined);
-		const hasLong = !!g('entry_long')?.conditions?.length;
-		const hasShort = !!g('entry_short')?.conditions?.length;
-		if (hasShort && hasLong) return 'both';
-		if (hasShort) return 'short_only';
-		return 'long_only';
-	}
-	$: effectiveTradeMode = buildMode === 'visual' ? deriveVisualTradeMode(visualSpec) : tradeMode;
-
-	// Per-spec scratch id so distinct ad-hoc visual strategies don't all collide
-	// under the bare "rule_engine" row (results stay attributable; re-running the
-	// same spec reuses the same id). Backend resolves "rule_engine__*" -> rule_engine.
-	function hashSpec(spec: Record<string, unknown>): string {
-		const s = JSON.stringify(spec ?? {});
-		let h = 5381;
-		for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
-		return h.toString(36);
-	}
-	$: visualStrategyId = `${RULE_ENGINE_TYPE}__${hashSpec(visualSpec)}`;
-	const CUSTOM_TEMPLATE = `import pandas as pd
-import numpy as np
-from forven.strategies.base import BaseStrategy, Signal
-
-
-class MyStrategy(BaseStrategy):
-    @property
-    def name(self) -> str:
-        return "My Strategy"
-
-    @property
-    def asset(self) -> str:
-        return "BTC"
-
-    @property
-    def strategy_type(self) -> str:
-        return "my_strategy"
-
-    @property
-    def default_params(self) -> dict:
-        # Add ANY parameters you want — they render as editable fields below.
-        return {"rsi_length": 14, "oversold": 30, "overbought": 70}
-
-    def _rsi(self, close, n):
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(n).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(n).mean()
-        return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
-
-    def generate_signals(self, df):
-        # Vectorized (required for perf): return (entries, exits) boolean Series.
-        n = int(self.params["rsi_length"])
-        rsi = self._rsi(df["close"], n)
-        entries = (rsi < self.params["oversold"]).fillna(False)
-        exits = (rsi > self.params["overbought"]).fillna(False)
-        return entries, exits
-
-    def generate_signal(self, df):
-        n = int(self.params["rsi_length"])
-        if len(df) < n + 1:
-            return Signal()
-        rsi = self._rsi(df["close"], n).iloc[-1]
-        price = float(df["close"].iloc[-1])
-        if rsi < self.params["oversold"]:
-            return Signal(entry_signal=True, direction="long", price=price)
-        if rsi > self.params["overbought"]:
-            return Signal(exit_signal=True, price=price)
-        return Signal()
-
-
-STRATEGY_CLASS = MyStrategy
-TYPE_NAME = "my_strategy"
-`;
-	let customCode = CUSTOM_TEMPLATE;
-	type CustomStatus = 'idle' | 'validating' | 'loaded' | 'failed';
-	let customStatus: CustomStatus = 'idle';
-	let customErrors: string[] = [];
-	let customWarnings: string[] = [];
-	let customLoadedName = '';
 
 	// Form state
 	const defaultRange = resolveDateRangePreset('1y');
@@ -170,15 +73,7 @@ TYPE_NAME = "my_strategy"
 	let lastResultId = '';
 	let lastStrategyId = '';
 
-	// Send-to-Forge state (only for user-authored strategies).
-	let sendingToForge = false;
-	let forgeError = '';
-
 	$: busy = submitStatus === 'submitting';
-	// A user-authored strategy is forge-able once it's loaded (code) or valid (visual).
-	$: canSendToForge =
-		(buildMode === 'custom' && customStatus === 'loaded' && !!customLoadedName) ||
-		(buildMode === 'visual' && visualValid);
 	$: estimatedBars = estimateBarCount(startDate, endDate, timeframe);
 	$: numberOrNull = (v: string) => (v.trim() === '' ? null : Number(v));
 
@@ -240,7 +135,6 @@ TYPE_NAME = "my_strategy"
 	function applyStrategy(key: string) {
 		selectedKey = key;
 		selectedStrategy = strategies.find((s) => (s.api_name || s.name) === key) ?? null;
-		// Reset downstream state when the strategy changes.
 		preview = null;
 		previewError = '';
 		if (selectedStrategy?.parameters) {
@@ -250,7 +144,6 @@ TYPE_NAME = "my_strategy"
 		} else {
 			paramsDraft = {};
 		}
-		// Prefill symbol/timeframe from the strategy's stored values when present.
 		const sSym = (selectedStrategy as Record<string, unknown> | null)?.symbol;
 		const sTf = (selectedStrategy as Record<string, unknown> | null)?.timeframe;
 		if (typeof sSym === 'string' && sSym.trim()) symbol = sSym.trim();
@@ -261,93 +154,13 @@ TYPE_NAME = "my_strategy"
 		applyStrategy((event.target as HTMLSelectElement).value);
 	}
 
-	function setBuildMode(mode: 'select' | 'visual' | 'custom') {
-		buildMode = mode;
-		// Switching modes clears the active selection so we never run the wrong one.
-		selectedStrategy = null;
-		selectedKey = '';
-		paramsDraft = {};
-		preview = null;
-		previewError = '';
-		if (mode !== 'custom') {
-			customStatus = 'idle';
-			customLoadedName = '';
-		}
-		if (mode === 'visual') {
-			syncVisualSelection();
-		}
-	}
-
-	// The visual builder is "selected" (runnable) whenever it produces a valid spec.
-	function syncVisualSelection() {
-		if (buildMode !== 'visual') return;
-		if (visualValid) {
-			selectedStrategy = {
-				name: 'Visual strategy',
-				api_name: RULE_ENGINE_TYPE,
-				version: 'custom',
-				description: 'No-code rule strategy built in this page',
-				parameters: {},
-			} as unknown as Strategy;
-			selectedKey = RULE_ENGINE_TYPE;
-		} else {
-			selectedStrategy = null;
-			selectedKey = '';
-		}
-	}
-
-	function onBuilderChange(event: CustomEvent<{ spec: Record<string, unknown>; valid: boolean; errors: string[] }>) {
-		visualSpec = event.detail.spec;
-		visualValid = event.detail.valid;
-		visualErrors = event.detail.errors;
-		preview = null; // spec changed → stale preview
-		syncVisualSelection();
-	}
-
-	async function loadCustomStrategy() {
-		customStatus = 'validating';
-		customErrors = [];
-		customWarnings = [];
-		try {
-			const res = await registerCustomStrategy({ code: customCode });
-			customErrors = res.errors ?? [];
-			customWarnings = res.warnings ?? [];
-			if (res.valid && res.registered && res.strategy_name) {
-				customLoadedName = res.strategy_name;
-				customStatus = 'loaded';
-				// Treat the registered custom type like a selected strategy.
-				selectedStrategy = {
-					name: res.strategy_name,
-					api_name: res.strategy_name,
-					version: 'custom',
-					description: 'Custom strategy (authored in this page)',
-					parameters: {},
-				} as unknown as Strategy;
-				selectedKey = res.strategy_name;
-				paramsDraft = { ...(res.default_params ?? {}) };
-				preview = null;
-			} else {
-				customStatus = 'failed';
-				selectedStrategy = null;
-				selectedKey = '';
-				if (customErrors.length === 0) customErrors = ['Strategy failed validation.'];
-			}
-		} catch (err) {
-			customStatus = 'failed';
-			customErrors = [err instanceof Error ? err.message : 'Failed to validate strategy'];
-		}
-	}
-
 	function onParamsChange(event: CustomEvent<Record<string, unknown>>) {
 		paramsDraft = event.detail;
-		preview = null; // params changed → stale preview
+		preview = null;
 	}
 
 	function validate(): string | null {
-		if (buildMode === 'visual' && !visualValid) {
-			return visualErrors[0] || 'Complete the visual strategy (add at least one entry condition).';
-		}
-		if (!selectedStrategy) return buildMode === 'custom' ? 'Validate & load your custom strategy first.' : 'Select a strategy to backtest.';
+		if (!selectedStrategy) return 'Select a strategy to backtest.';
 		if (!symbol.trim()) return 'Symbol is required.';
 		if (startDate && endDate && startDate >= endDate) return 'Start date must be before end date.';
 		if (!Number.isFinite(initialCapital) || initialCapital <= 0) return 'Initial capital must be greater than 0.';
@@ -355,12 +168,10 @@ TYPE_NAME = "my_strategy"
 		if (!Number.isFinite(slippageBps) || slippageBps < 0) return 'Slippage (bps) cannot be negative.';
 		if (!Number.isFinite(leverage) || leverage < 1) return 'Leverage must be at least 1.';
 		if (leverage > 125) return 'Leverage above 125× is not supported.';
-
-		// Sizing-mode-specific validation.
 		if (sizingMode === 'fraction') {
 			if (!(riskPerTrade > 0 && riskPerTrade <= 1)) return 'Risk per trade must be between 0 and 1.';
 			if (stopLossPct == null && trailingStopPct == null)
-				return 'Fraction (risk-based) sizing needs a Stop Loss % or Trailing Stop % to size the position against.';
+				return 'Fraction (risk-based) sizing needs a Stop Loss % or Trailing Stop %.';
 		}
 		if (sizingMode === 'fixed' && !(fixedSize > 0)) return 'Fixed size must be greater than 0.';
 		if (sizingMode === 'atr') {
@@ -371,45 +182,33 @@ TYPE_NAME = "my_strategy"
 			if (!(kellyMultiplier > 0 && kellyMultiplier <= 5)) return 'Kelly multiplier must be between 0 and 5.';
 			if (!(Number.isInteger(kellyLookback) && kellyLookback >= 1)) return 'Kelly lookback must be a positive whole number.';
 		}
-
-		// Stop/target bounds (apply whenever set).
 		if (stopLossPct != null && !(stopLossPct > 0 && stopLossPct <= 100)) return 'Stop Loss % must be between 0 and 100.';
 		if (takeProfitPct != null && !(takeProfitPct > 0)) return 'Take Profit % must be greater than 0.';
 		if (trailingStopPct != null && !(trailingStopPct > 0 && trailingStopPct <= 100)) return 'Trailing Stop % must be between 0 and 100.';
 		if (timeStopBars != null && !(Number.isInteger(timeStopBars) && timeStopBars >= 1)) return 'Time Stop must be a positive whole number of bars.';
-
 		if (estimatedBars != null && estimatedBars > BAR_CAP)
-			return `This window is ~${estimatedBars.toLocaleString()} bars; the engine caps at ${BAR_CAP.toLocaleString()}. Shorten the range or use a higher timeframe.`;
+			return `This window is ~${estimatedBars.toLocaleString()} bars; the engine caps at ${BAR_CAP.toLocaleString()}.`;
 		return null;
 	}
 
 	function buildRequest() {
-		const strategyId = buildMode === 'visual' ? visualStrategyId : (selectedStrategy!.api_name || selectedStrategy!.name);
-		const strategyName = buildMode === 'visual' ? RULE_ENGINE_TYPE : strategyId;
-		const requestParams: Record<string, unknown> | undefined =
-			buildMode === 'visual'
-				? { spec: visualSpec, _asset: baseAsset }
-				: Object.keys(paramsDraft).length > 0
-					? paramsDraft
-					: undefined;
+		const strategyId = selectedStrategy!.api_name || selectedStrategy!.name;
 		return {
 			strategy_id: strategyId,
-			strategy_name: strategyName,
-			strategy_version: buildMode === 'visual' ? 'custom' : selectedStrategy!.version,
+			strategy_name: strategyId,
+			strategy_version: selectedStrategy!.version,
 			symbol: symbol.trim(),
 			timeframe,
 			start: startDate,
 			end: endDate,
-			params: requestParams,
-			// Explicit user-initiated run — keep the result even if it misses the
-			// quick_screen gate (weak metrics), so it isn't silently auto-trashed.
+			params: Object.keys(paramsDraft).length > 0 ? paramsDraft : undefined,
 			preserve_result: true,
 			initial_capital: initialCapital,
 			fee_bps: feeBps,
 			slippage_bps: slippageBps,
 			leverage,
-			trade_mode: effectiveTradeMode,
-			allow_shorting: effectiveTradeMode !== 'long_only',
+			trade_mode: tradeMode,
+			allow_shorting: tradeMode !== 'long_only',
 			sizing_mode: sizingMode,
 			risk_per_trade: sizingMode === 'fraction' || sizingMode === 'atr' ? riskPerTrade : undefined,
 			fixed_size: sizingMode === 'fixed' ? fixedSize : undefined,
@@ -432,18 +231,15 @@ TYPE_NAME = "my_strategy"
 		previewError = '';
 		preview = null;
 		try {
-			const strategyKey = buildMode === 'visual' ? RULE_ENGINE_TYPE : (selectedStrategy.api_name || selectedStrategy.name);
 			preview = await previewSignals({
-				strategy_name: strategyKey,
+				strategy_name: selectedStrategy.api_name || selectedStrategy.name,
 				strategy_version: selectedStrategy.version,
 				symbol: symbol.trim(),
 				timeframe,
 				start: startDate,
 				end: endDate,
-				trade_mode: effectiveTradeMode,
-				params: buildMode === 'visual'
-					? { spec: visualSpec, _asset: baseAsset }
-					: Object.keys(paramsDraft).length > 0 ? paramsDraft : undefined,
+				trade_mode: tradeMode,
+				params: Object.keys(paramsDraft).length > 0 ? paramsDraft : undefined,
 			});
 		} catch (err) {
 			previewError = err instanceof Error ? err.message : 'Signal preview failed';
@@ -458,29 +254,19 @@ TYPE_NAME = "my_strategy"
 			submitError = error;
 			return;
 		}
-
 		submitStatus = 'submitting';
 		submitError = '';
 		submitWarning = '';
 		inlineResult = null;
-
 		const request = buildRequest();
 		const strategyId = request.strategy_id;
-
 		try {
 			const job = await submitBacktest(request);
 			lastStrategyId = strategyId;
 			if (job.warning) submitWarning = job.warning;
-
-			if (job.status === 'succeeded') {
-				addToast(`Backtest for ${strategyId} completed`, 'success');
-			} else {
-				addToast(`Backtest for ${strategyId} queued (job ${job.job_id})`, 'info');
-			}
-
+			if (job.status === 'succeeded') addToast(`Backtest for ${strategyId} completed`, 'success');
+			else addToast(`Backtest for ${strategyId} queued (job ${job.job_id})`, 'info');
 			submitStatus = 'idle';
-
-			// Fetch and render the result inline (the page no longer abandons the run).
 			if (job.result_id) {
 				lastResultId = job.result_id;
 				resultLoading = true;
@@ -491,7 +277,6 @@ TYPE_NAME = "my_strategy"
 				} finally {
 					resultLoading = false;
 				}
-				// Scroll the results into view.
 				queueMicrotask(() => document.getElementById('bt-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
 			}
 		} catch (err) {
@@ -503,25 +288,6 @@ TYPE_NAME = "my_strategy"
 	function openFullReport() {
 		if (!lastStrategyId) return;
 		goto(`/lab/strategy/${encodeURIComponent(lastStrategyId)}?returnTo=/backtest/new`);
-	}
-
-	async function handleSendToForge() {
-		if (!canSendToForge || sendingToForge) return;
-		sendingToForge = true;
-		forgeError = '';
-		try {
-			const payload =
-				buildMode === 'visual'
-					? { mode: 'visual' as const, spec: visualSpec, symbol: symbol.trim(), timeframe }
-					: { mode: 'code' as const, type_name: customLoadedName, params: paramsDraft, symbol: symbol.trim(), timeframe };
-			const res = await sendStrategyToForge(payload);
-			addToast(`Sent to the Forge as ${res.display_id} (${res.stage})`, 'success', `/lab/strategy/${res.strategy_id}`);
-			await goto(`/lab/strategy/${encodeURIComponent(res.strategy_id)}?returnTo=/backtest/new`);
-		} catch (err) {
-			forgeError = err instanceof Error ? err.message : 'Failed to send strategy to the Forge';
-		} finally {
-			sendingToForge = false;
-		}
 	}
 
 	function resetForNextRun() {
@@ -547,152 +313,70 @@ TYPE_NAME = "my_strategy"
 						Pick a strategy, configure execution, preview signals, and run — results appear inline.
 					</p>
 				</div>
+				<a href="/strategy-creator"
+					class="inline-flex items-center gap-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-[12px] font-medium text-cyan-200 transition hover:bg-cyan-500/20">
+					✨ Build your own → Strategy Creator
+				</a>
 			</div>
 		</div>
 
 		<form id="bt-config" on:submit|preventDefault={handleSubmit} novalidate>
-			<!-- Strategy Selection / Build -->
+			<!-- Strategy Selection -->
 			<div class="mt-6 rounded-2xl border border-[#1a1a1a] bg-[#0a0a0a] p-5">
-				<!-- Mode toggle -->
 				<div class="flex items-center justify-between gap-3">
-					<div class="inline-flex rounded-lg border border-[#2b2b2b] bg-[#070707] p-0.5 text-[11px]">
-						<button type="button" on:click={() => setBuildMode('select')} disabled={busy}
-							aria-pressed={buildMode === 'select'}
-							class="rounded-md px-3 py-1 transition {buildMode === 'select' ? 'bg-cyan-500/15 text-cyan-200' : 'text-gray-500 hover:text-gray-300'}">
-							Select strategy
-						</button>
-						<button type="button" on:click={() => setBuildMode('visual')} disabled={busy}
-							aria-pressed={buildMode === 'visual'}
-							class="rounded-md px-3 py-1 transition {buildMode === 'visual' ? 'bg-cyan-500/15 text-cyan-200' : 'text-gray-500 hover:text-gray-300'}">
-							Visual builder
-						</button>
-						<button type="button" on:click={() => setBuildMode('custom')} disabled={busy}
-							aria-pressed={buildMode === 'custom'}
-							class="rounded-md px-3 py-1 transition {buildMode === 'custom' ? 'bg-cyan-500/15 text-cyan-200' : 'text-gray-500 hover:text-gray-300'}">
-							Code (Python)
-						</button>
+					<div class="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+						Strategy
+						<span class="ml-2 rounded bg-[#1a1a1a] px-1.5 py-0.5 text-[10px] tabular-nums text-gray-400">{strategies.length}</span>
 					</div>
-					{#if buildMode === 'select'}
-						<button
-							type="button"
-							on:click={toggleAppGenerated}
+					<button
+						type="button"
+						on:click={toggleAppGenerated}
+						disabled={busy}
+						aria-pressed={includeAppGenerated}
+						class="inline-flex items-center gap-2 rounded border px-3 py-1 text-[11px] transition {includeAppGenerated
+							? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
+							: 'border-[#2b2b2b] bg-[#111] text-gray-500 hover:border-gray-600 hover:text-gray-300'}"
+					>
+						<span class="inline-block h-2 w-2 rounded-full {includeAppGenerated ? 'bg-cyan-400' : 'bg-gray-600'}"></span>
+						Include app-generated strategies
+					</button>
+				</div>
+				<div class="mt-3">
+					{#if loadingStrategies}
+						<div class="text-sm text-gray-500" role="status" aria-live="polite">Loading strategies…</div>
+					{:else if loadError}
+						<div class="flex flex-wrap items-center gap-3" role="alert">
+							<span class="text-sm text-red-400">{loadError}</span>
+							<button type="button" on:click={loadStrategies}
+								class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white">Retry</button>
+						</div>
+					{:else}
+						<select
+							id="bt-strategy"
+							class="w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60"
+							on:change={onStrategySelect}
 							disabled={busy}
-							aria-pressed={includeAppGenerated}
-							class="inline-flex items-center gap-2 rounded border px-3 py-1 text-[11px] transition {includeAppGenerated
-								? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
-								: 'border-[#2b2b2b] bg-[#111] text-gray-500 hover:border-gray-600 hover:text-gray-300'}"
+							value={selectedKey}
 						>
-							<span class="inline-block h-2 w-2 rounded-full {includeAppGenerated ? 'bg-cyan-400' : 'bg-gray-600'}"></span>
-							Include app-generated strategies
-						</button>
+							<option value="" disabled>Select a strategy…</option>
+							{#each strategies as strategy}
+								<option value={strategy.api_name || strategy.name}>
+									{strategy.name}{strategy.api_name && strategy.api_name !== strategy.name ? ` (${strategy.api_name})` : ''}
+								</option>
+							{/each}
+						</select>
+						{#if selectedStrategy?.description}
+							<div class="mt-2 text-xs text-gray-500">{selectedStrategy.description}</div>
+						{/if}
 					{/if}
 				</div>
-
-				{#if buildMode === 'select'}
-					<div class="mt-3">
-						<label for="bt-strategy" class="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-							Strategy
-							<span class="ml-2 rounded bg-[#1a1a1a] px-1.5 py-0.5 text-[10px] tabular-nums text-gray-400">{strategies.length}</span>
-						</label>
-						{#if loadingStrategies}
-							<div class="mt-2 text-sm text-gray-500" role="status" aria-live="polite">Loading strategies…</div>
-						{:else if loadError}
-							<div class="mt-2 flex flex-wrap items-center gap-3" role="alert">
-								<span class="text-sm text-red-400">{loadError}</span>
-								<button type="button" on:click={loadStrategies}
-									class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white">
-									Retry
-								</button>
-							</div>
-						{:else}
-							<select
-								id="bt-strategy"
-								class="mt-2 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] outline-none transition focus:border-white/60"
-								on:change={onStrategySelect}
-								disabled={busy}
-								value={selectedKey}
-							>
-								<option value="" disabled>Select a strategy…</option>
-								{#each strategies as strategy}
-									<option value={strategy.api_name || strategy.name}>
-										{strategy.name}{strategy.api_name && strategy.api_name !== strategy.name ? ` (${strategy.api_name})` : ''}
-									</option>
-								{/each}
-							</select>
-							{#if selectedStrategy?.description}
-								<div class="mt-2 text-xs text-gray-500">{selectedStrategy.description}</div>
-							{/if}
-						{/if}
-					</div>
-				{:else if buildMode === 'visual'}
-					<!-- Build from scratch: no-code visual rule builder -->
-					<div class="mt-3">
-						<p class="mb-3 text-[11px] text-gray-500">
-							Add indicators, define entry/exit conditions, and add any parameters — no code. Runs through the same engine
-							with full execution controls. Use <span class="font-mono text-gray-400">Preview signals</span> below to sanity-check before running.
-						</p>
-						<RuleBuilder disabled={busy} on:change={onBuilderChange} />
-					</div>
-				{:else}
-					<!-- Build from scratch: custom strategy code editor -->
-					<div class="mt-3">
-						<div class="flex flex-wrap items-center justify-between gap-2">
-							<div class="text-[10px] uppercase tracking-[0.24em] text-gray-500">Custom Strategy Code (Python)</div>
-							<a href="/docs" class="text-[10px] text-gray-600 hover:text-gray-400">BaseStrategy reference →</a>
-						</div>
-						<p class="mt-1 text-[11px] text-gray-500">
-							Subclass <span class="font-mono text-gray-400">BaseStrategy</span>, return entries/exits from
-							<span class="font-mono text-gray-400">generate_signals(df)</span>, and put any parameters in
-							<span class="font-mono text-gray-400">default_params</span> — they become editable fields below.
-							Must export <span class="font-mono text-gray-400">STRATEGY_CLASS</span> and <span class="font-mono text-gray-400">TYPE_NAME</span>.
-						</p>
-						<textarea
-							bind:value={customCode}
-							spellcheck="false"
-							rows="18"
-							disabled={busy || customStatus === 'validating'}
-							class="mt-2 w-full resize-y rounded border border-[#2b2b2b] bg-black px-3 py-2 font-mono text-[12px] leading-5 text-gray-200 outline-none transition focus:border-cyan-400/60"
-						></textarea>
-						<div class="mt-3 flex flex-wrap items-center gap-3">
-							<button type="button" on:click={loadCustomStrategy}
-								disabled={busy || customStatus === 'validating' || !customCode.trim()}
-								class="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-4 py-1.5 text-[12px] font-medium text-cyan-200 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-40">
-								{customStatus === 'validating' ? 'Validating…' : 'Validate & load strategy'}
-							</button>
-							<button type="button" on:click={() => (customCode = CUSTOM_TEMPLATE)} disabled={busy || customStatus === 'validating'}
-								class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1.5 text-[11px] text-gray-400 transition hover:text-gray-200">
-								Reset to template
-							</button>
-							{#if customStatus === 'loaded' && customLoadedName}
-								<span class="inline-flex items-center gap-1.5 text-[12px] text-emerald-300">
-									<span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span>
-									Loaded <span class="font-mono">{customLoadedName}</span> — edit params &amp; run below.
-								</span>
-							{/if}
-						</div>
-						{#if customErrors.length}
-							<div class="mt-3 space-y-1" role="alert">
-								{#each customErrors as e}
-									<div class="rounded border border-red-900/40 bg-red-950/20 px-3 py-1.5 font-mono text-[11px] text-red-300">{e}</div>
-								{/each}
-							</div>
-						{/if}
-						{#if customWarnings.length}
-							<div class="mt-2 space-y-1">
-								{#each customWarnings as w}
-									<div class="rounded border border-amber-900/40 bg-amber-950/20 px-3 py-1.5 text-[11px] text-amber-300">{w}</div>
-								{/each}
-							</div>
-						{/if}
-					</div>
-				{/if}
 			</div>
 
 			<!-- Market Scope -->
 			<div class="mt-6 rounded-2xl border border-[#1a1a1a] bg-[#0a0a0a] p-5">
 				<div class="text-[10px] uppercase tracking-[0.24em] text-gray-500">Market Scope</div>
 				<div class="mt-3 grid gap-4 md:grid-cols-2">
-					<SymbolInput id="bt-symbol" bind:value={symbol} disabled={busy} suggestions={symbolSuggestions} helpText="Backtested on the base asset (e.g. BTC). Pick from your available datasets." />
+					<SymbolInput id="bt-symbol" bind:value={symbol} disabled={busy} suggestions={symbolSuggestions} helpText="Backtested on the base asset (e.g. BTC)." />
 					<TimeframeSelect id="bt-timeframe" bind:value={timeframe} disabled={busy} />
 				</div>
 				<div class="mt-4">
@@ -700,8 +384,8 @@ TYPE_NAME = "my_strategy"
 				</div>
 			</div>
 
-			<!-- Strategy Parameters (builder owns params in visual mode) -->
-			{#if selectedStrategy && buildMode !== 'visual'}
+			<!-- Strategy Parameters -->
+			{#if selectedStrategy}
 				<div class="mt-6 rounded-2xl border border-[#1a1a1a] bg-[#0a0a0a] p-5">
 					<div class="text-[10px] uppercase tracking-[0.24em] text-gray-500">Strategy Parameters</div>
 					<div class="mt-3">
@@ -717,119 +401,56 @@ TYPE_NAME = "my_strategy"
 					<span class="text-sm text-gray-500">{showAdvanced ? '−' : '+'}</span>
 				</button>
 				{#if showAdvanced}
-					<!-- Capital & costs -->
 					<div class="mt-4 text-[10px] uppercase tracking-[0.2em] text-gray-600">Capital &amp; Costs</div>
 					<div class="mt-2 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Initial Capital</div>
-							<input type="number" bind:value={initialCapital} step="1000" min="100" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Fee (bps)</div>
-							<input type="number" bind:value={feeBps} step="1" min="0" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Slippage (bps)</div>
-							<input type="number" bind:value={slippageBps} step="1" min="0" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Leverage</div>
-							<input type="number" bind:value={leverage} step="0.5" min="1" max="125" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Trade Direction</div>
-							<select bind:value={tradeMode} disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60">
-								<option value="long_only">Long only</option>
-								<option value="short_only">Short only</option>
-								<option value="both">Both (hedged)</option>
-							</select>
-						</label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Initial Capital</div>
+							<input type="number" bind:value={initialCapital} step="1000" min="100" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Fee (bps)</div>
+							<input type="number" bind:value={feeBps} step="1" min="0" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Slippage (bps)</div>
+							<input type="number" bind:value={slippageBps} step="1" min="0" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Leverage</div>
+							<input type="number" bind:value={leverage} step="0.5" min="1" max="125" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Trade Direction</div>
+							<select bind:value={tradeMode} disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60">
+								<option value="long_only">Long only</option><option value="short_only">Short only</option><option value="both">Both (hedged)</option>
+							</select></label>
 					</div>
-
-					<!-- Position sizing -->
 					<div class="mt-5 text-[10px] uppercase tracking-[0.2em] text-gray-600">Position Sizing</div>
 					<div class="mt-2 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Sizing Mode</div>
-							<select bind:value={sizingMode} disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60">
-								<option value="full">Full equity (default)</option>
-								<option value="fraction">Fraction (risk-based)</option>
-								<option value="fixed">Fixed notional</option>
-								<option value="atr">ATR risk</option>
-								<option value="kelly">Kelly</option>
-							</select>
-						</label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Sizing Mode</div>
+							<select bind:value={sizingMode} disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60">
+								<option value="full">Full equity (default)</option><option value="fraction">Fraction (risk-based)</option><option value="fixed">Fixed notional</option><option value="atr">ATR risk</option><option value="kelly">Kelly</option>
+							</select></label>
 						{#if sizingMode === 'fraction' || sizingMode === 'atr'}
-							<label class="block">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Risk Per Trade</div>
-								<input type="number" bind:value={riskPerTrade} step="0.005" min="0" max="1" disabled={busy}
-									class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-							</label>
+							<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Risk Per Trade</div>
+								<input type="number" bind:value={riskPerTrade} step="0.005" min="0" max="1" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
 						{/if}
 						{#if sizingMode === 'fixed'}
-							<label class="block">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Fixed Size (quote)</div>
-								<input type="number" bind:value={fixedSize} step="100" min="0" disabled={busy}
-									class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-							</label>
+							<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Fixed Size (quote)</div>
+								<input type="number" bind:value={fixedSize} step="100" min="0" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
 						{/if}
 						{#if sizingMode === 'atr'}
-							<label class="block">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">ATR Stop Multiplier</div>
-								<input type="number" bind:value={atrStopMultiplier} step="0.1" min="0" disabled={busy}
-									class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-							</label>
+							<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">ATR Stop Multiplier</div>
+								<input type="number" bind:value={atrStopMultiplier} step="0.1" min="0" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
 						{/if}
 						{#if sizingMode === 'kelly'}
-							<label class="block">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Kelly Multiplier</div>
-								<input type="number" bind:value={kellyMultiplier} step="0.05" min="0" max="5" disabled={busy}
-									class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-							</label>
-							<label class="block">
-								<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Kelly Lookback (trades)</div>
-								<input type="number" bind:value={kellyLookback} step="10" min="1" disabled={busy}
-									class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-							</label>
+							<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Kelly Multiplier</div>
+								<input type="number" bind:value={kellyMultiplier} step="0.05" min="0" max="5" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+							<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Kelly Lookback (trades)</div>
+								<input type="number" bind:value={kellyLookback} step="10" min="1" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
 						{/if}
 					</div>
-					{#if sizingMode === 'fraction'}
-						<p class="mt-2 text-[11px] text-gray-500">Fraction sizing requires a Stop Loss % or Trailing Stop % — the position is sized to risk this fraction of equity at the stop.</p>
-					{/if}
-
-					<!-- Exits / risk stops -->
 					<div class="mt-5 text-[10px] uppercase tracking-[0.2em] text-gray-600">Exits &amp; Stops</div>
 					<div class="mt-2 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Stop Loss %</div>
-							<input type="number" value={stopLossPct ?? ''} on:input={(e) => (stopLossPct = numberOrNull((e.currentTarget as HTMLInputElement).value))}
-								step="0.5" min="0" max="100" placeholder="None" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Take Profit %</div>
-							<input type="number" value={takeProfitPct ?? ''} on:input={(e) => (takeProfitPct = numberOrNull((e.currentTarget as HTMLInputElement).value))}
-								step="0.5" min="0" placeholder="None" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Trailing Stop %</div>
-							<input type="number" value={trailingStopPct ?? ''} on:input={(e) => (trailingStopPct = numberOrNull((e.currentTarget as HTMLInputElement).value))}
-								step="0.5" min="0" max="100" placeholder="None" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
-						<label class="block">
-							<div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Time Stop (bars)</div>
-							<input type="number" value={timeStopBars ?? ''} on:input={(e) => (timeStopBars = numberOrNull((e.currentTarget as HTMLInputElement).value))}
-								step="1" min="1" placeholder="None" disabled={busy}
-								class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none transition focus:border-white/60" />
-						</label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Stop Loss %</div>
+							<input type="number" value={stopLossPct ?? ''} on:input={(e) => (stopLossPct = numberOrNull(e.currentTarget.value))} step="0.5" min="0" max="100" placeholder="None" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Take Profit %</div>
+							<input type="number" value={takeProfitPct ?? ''} on:input={(e) => (takeProfitPct = numberOrNull(e.currentTarget.value))} step="0.5" min="0" placeholder="None" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Trailing Stop %</div>
+							<input type="number" value={trailingStopPct ?? ''} on:input={(e) => (trailingStopPct = numberOrNull(e.currentTarget.value))} step="0.5" min="0" max="100" placeholder="None" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
+						<label class="block"><div class="text-[10px] uppercase tracking-[0.2em] text-gray-500">Time Stop (bars)</div>
+							<input type="number" value={timeStopBars ?? ''} on:input={(e) => (timeStopBars = numberOrNull(e.currentTarget.value))} step="1" min="1" placeholder="None" disabled={busy} class="mt-1.5 w-full rounded border border-[#2b2b2b] bg-[#050505] px-3 py-2 text-sm text-white outline-none focus:border-white/60" /></label>
 					</div>
 				{/if}
 			</div>
@@ -839,7 +460,7 @@ TYPE_NAME = "my_strategy"
 				<div class="flex items-center justify-between">
 					<div class="text-[10px] uppercase tracking-[0.24em] text-gray-500">Signal Preview</div>
 					<button type="button" on:click={handlePreview} disabled={busy || previewLoading || !selectedStrategy}
-						class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-40">
+						class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white disabled:opacity-40">
 						{previewLoading ? 'Previewing…' : 'Preview signals'}
 					</button>
 				</div>
@@ -850,19 +471,12 @@ TYPE_NAME = "my_strategy"
 						<div><span class="text-gray-500">Bars:</span> <span class="font-mono text-gray-300">{preview.total_bars.toLocaleString()}</span></div>
 						<div><span class="text-gray-500">Entries:</span> <span class="font-mono text-cyan-300">{preview.entry_count}</span></div>
 						<div><span class="text-gray-500">Exits:</span> <span class="font-mono text-gray-300">{preview.exit_count}</span></div>
-						<div>
-							<span class="text-gray-500">Density:</span>
-							<span class="font-mono {preview.signal_density === 'dense' ? 'text-emerald-300' : preview.signal_density === 'moderate' ? 'text-amber-300' : 'text-gray-400'}">{preview.signal_density}</span>
-						</div>
-						{#if preview.avg_bars_between_entries != null}
-							<div class="col-span-2"><span class="text-gray-500">Avg bars between entries:</span> <span class="font-mono text-gray-300">{preview.avg_bars_between_entries}</span></div>
-						{/if}
+						<div><span class="text-gray-500">Density:</span>
+							<span class="font-mono {preview.signal_density === 'dense' ? 'text-emerald-300' : preview.signal_density === 'moderate' ? 'text-amber-300' : 'text-gray-400'}">{preview.signal_density}</span></div>
 					</div>
 					{#if preview.warnings.length}
 						<div class="mt-2 space-y-1">
-							{#each preview.warnings as w}
-								<div class="rounded border border-amber-900/40 bg-amber-950/20 px-3 py-1.5 text-[11px] text-amber-300">{w}</div>
-							{/each}
+							{#each preview.warnings as w}<div class="rounded border border-amber-900/40 bg-amber-950/20 px-3 py-1.5 text-[11px] text-amber-300">{w}</div>{/each}
 						</div>
 					{/if}
 				{:else}
@@ -872,25 +486,12 @@ TYPE_NAME = "my_strategy"
 
 			<!-- Submit -->
 			<div class="mt-6 rounded-2xl border border-[#1a1a1a] bg-[#0a0a0a] p-5">
-				{#if submitError}
-					<div class="mb-4 rounded-xl border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-300" role="alert">{submitError}</div>
-				{/if}
-				{#if forgeError}
-					<div class="mb-4 rounded-xl border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-300" role="alert">{forgeError}</div>
-				{/if}
+				{#if submitError}<div class="mb-4 rounded-xl border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-300" role="alert">{submitError}</div>{/if}
 				<div class="flex flex-wrap items-center gap-3">
 					<button type="submit" disabled={busy || resultLoading || !selectedStrategy} aria-busy={busy}
 						class="inline-flex items-center gap-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-6 py-2.5 text-sm font-medium text-cyan-200 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-40">
 						{#if busy || resultLoading}Running backtest…{:else}Run Backtest{/if}
 					</button>
-					{#if canSendToForge}
-						<button type="button" on:click={handleSendToForge} disabled={busy || sendingToForge} aria-busy={sendingToForge}
-							class="inline-flex items-center gap-2 rounded-lg border border-violet-500/40 bg-violet-500/10 px-5 py-2.5 text-sm font-medium text-violet-200 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-							title="Create this strategy in The Forge (/lab) so it enters the pipeline">
-							{#if sendingToForge}Sending…{:else}Send to Forge →{/if}
-						</button>
-						<span class="text-[11px] text-gray-600">Adds your strategy to The Forge (/lab) to enter the pipeline.</span>
-					{/if}
 				</div>
 			</div>
 		</form>
@@ -899,9 +500,7 @@ TYPE_NAME = "my_strategy"
 		{#if resultLoading || inlineResult || submitWarning}
 			<div id="bt-results" class="mt-8 scroll-mt-6">
 				{#if submitWarning}
-					<div class="mb-4 rounded-xl border border-amber-900/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-300" role="alert">
-						⚠ {submitWarning}
-					</div>
+					<div class="mb-4 rounded-xl border border-amber-900/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-300" role="alert">⚠ {submitWarning}</div>
 				{/if}
 				<div class="rounded-2xl border border-[#1a1a1a] bg-gradient-to-b from-[#0d0d0d] to-[#080808] px-6 py-5">
 					<div class="flex flex-wrap items-center justify-between gap-3">
@@ -911,17 +510,12 @@ TYPE_NAME = "my_strategy"
 						</div>
 						<div class="flex items-center gap-2">
 							<button type="button" on:click={resetForNextRun}
-								class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1.5 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white">
-								Adjust &amp; re-run
-							</button>
+								class="rounded border border-[#2b2b2b] bg-[#111] px-3 py-1.5 text-[11px] text-gray-300 transition hover:border-gray-600 hover:text-white">Adjust &amp; re-run</button>
 							<button type="button" on:click={openFullReport} disabled={!lastStrategyId}
-								class="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] text-cyan-200 transition hover:bg-cyan-500/20 disabled:opacity-40">
-								Open full report →
-							</button>
+								class="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] text-cyan-200 transition hover:bg-cyan-500/20 disabled:opacity-40">Open full report →</button>
 						</div>
 					</div>
 				</div>
-
 				<div class="mt-4">
 					{#if resultLoading}
 						<div class="rounded-2xl border border-[#1a1a1a] bg-[#0a0a0a] p-8 text-center text-sm text-gray-500" role="status" aria-live="polite">Loading result…</div>

@@ -492,9 +492,28 @@ def get_backtest_result_chart_context(result_id: str, remote_skip: bool = False)
 
     return core.get_backtest_chart_context(result_id, remote_skip=remote_skip)
 
+@router.get("/api/indicators")
+def list_indicators():
+    """Catalog of indicators available to the no-code rule engine / Strategy Creator."""
+    from forven.strategies import indicators as indicators_registry
+    return {"indicators": indicators_registry.metadata()}
+
+
 @router.post("/api/backtests/preview")
 def post_backtest_preview(body: core.BacktestPreviewBody):
     return core.post_backtest_preview(body)
+
+
+@router.post("/api/backtests/preview-chart")
+def post_backtest_preview_chart(body: core.PreviewChartBody):
+    """Live chart context (bars + overlays + signal markers) for a visual spec."""
+    return core.post_backtest_preview_chart(body)
+
+
+@router.post("/api/backtests/nl-to-spec")
+async def post_nl_to_spec(body: core.NlToSpecBody):
+    """Generate a rule_engine spec from a natural-language strategy description."""
+    return await core.post_nl_to_spec(body)
 
 @router.post("/api/backtests/custom-strategy")
 def post_register_manual_strategy(body: core.ManualStrategyBody):

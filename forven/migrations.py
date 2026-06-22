@@ -346,6 +346,52 @@ def _m_2026_06_unique_open_trade(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m_2026_06_user_strategy_library(conn: sqlite3.Connection) -> None:
+    """User-owned strategy library for the Strategy Creator.
+
+    Saved drafts — visual rule-engine specs or custom Python code — that a user
+    can name, reopen, edit, duplicate and version. Distinct from the lifecycle
+    ``strategies`` table (pipeline-managed, hypothesis-required): these are
+    personal building blocks that only enter the pipeline via send-to-forge.
+    Soft-deleted via ``deleted_at`` so the UI can show/restore trashed drafts.
+
+    Idempotent: CREATE TABLE/INDEX IF NOT EXISTS.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_strategies (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL DEFAULT 'operator',
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'visual',
+            description TEXT NOT NULL DEFAULT '',
+            spec_json TEXT,
+            code TEXT,
+            symbol TEXT NOT NULL DEFAULT 'BTC/USDT',
+            timeframe TEXT NOT NULL DEFAULT '1h',
+            params_json TEXT NOT NULL DEFAULT '{}',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'draft',
+            version INTEGER NOT NULL DEFAULT 1,
+            parent_library_id TEXT,
+            forge_strategy_id TEXT,
+            last_result_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+            deleted_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_strategies_owner "
+        "ON user_strategies (owner, deleted_at, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_strategies_forge "
+        "ON user_strategies (forge_strategy_id)"
+    )
+
+
 # Append new migrations to the END of this list. Never reorder, rename, or
 # delete existing entries — doing so will cause migrations to re-run on
 # databases that already applied them under the old name, or to silently
@@ -369,6 +415,10 @@ MIGRATIONS: list[Migration] = [
     Migration(
         name="2026_06_unique_open_trade",
         up=_m_2026_06_unique_open_trade,
+    ),
+    Migration(
+        name="2026_06_user_strategy_library",
+        up=_m_2026_06_user_strategy_library,
     ),
 ]
 
