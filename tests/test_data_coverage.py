@@ -1,6 +1,7 @@
 """Tests for GET /api/data/coverage endpoint."""
 from __future__ import annotations
 
+import time
 from unittest.mock import patch
 
 import pandas as pd
@@ -98,6 +99,136 @@ def test_get_coverage_omits_missing_streams(tmp_path):
 
     assert "SOL-USDT" in result
     assert "funding" not in result["SOL-USDT"]
+
+
+# ---------------------------------------------------------------------------
+# Coverage perf hardening: footer-metadata reads + mtime cache.
+#
+# The matrix rescans every stored series on each page visit. The original
+# implementation loaded and parsed the whole timestamp column of every parquet
+# (tens of millions of rows), holding the GIL for seconds and starving the
+# single-worker event loop until the live WebSocket dropped. These tests pin the
+# replacement: row count + date range come from footer metadata, and an unchanged
+# file is never re-read (served from the mtime+size cache).
+# ---------------------------------------------------------------------------
+
+
+def _reset_coverage_cache():
+    import forven.data as fd
+    with fd._coverage_cache_lock:
+        fd._coverage_cache.clear()
+
+
+def test_get_coverage_reports_precise_last_bar(tmp_path):
+    """`to_ts` carries the precise last-bar timestamp (drives matrix freshness)."""
+    ohlcv_dir = tmp_path / "ohlcv" / "BTC-USDT"
+    ohlcv_dir.mkdir(parents=True)
+    _make_ohlcv(5).to_parquet(ohlcv_dir / "1h.parquet")  # 5 hourly bars from 2020-01-01 00:00
+
+    _reset_coverage_cache()
+    with patch("forven.data.DATA_DIR", tmp_path / "ohlcv"):
+        with patch("forven.data_manager.FUNDING_DIR", tmp_path / "funding"):
+            with patch("forven.data_manager.OI_DIR", tmp_path / "oi"):
+                result = get_coverage()
+
+    entry = result["BTC-USDT"]["ohlcv/1h"]
+    assert entry["from"] == "2020-01-01"
+    assert entry["to"] == "2020-01-01"
+    assert entry["to_ts"].startswith("2020-01-01T04:00")  # last of 5 hourly bars
+
+
+def test_get_coverage_omits_empty_parquet(tmp_path):
+    """A zero-row parquet is omitted (rendered as 'not collected'), not errored."""
+    ohlcv_dir = tmp_path / "ohlcv" / "BTC-USDT"
+    ohlcv_dir.mkdir(parents=True)
+    _make_ohlcv(5).to_parquet(ohlcv_dir / "1h.parquet")
+    _make_ohlcv(0).to_parquet(ohlcv_dir / "1d.parquet")  # empty series
+
+    _reset_coverage_cache()
+    with patch("forven.data.DATA_DIR", tmp_path / "ohlcv"):
+        with patch("forven.data_manager.FUNDING_DIR", tmp_path / "funding"):
+            with patch("forven.data_manager.OI_DIR", tmp_path / "oi"):
+                result = get_coverage()
+
+    assert "ohlcv/1h" in result["BTC-USDT"]
+    assert "ohlcv/1d" not in result["BTC-USDT"]
+
+
+def test_coverage_entry_uses_mtime_cache(tmp_path):
+    """An unchanged parquet is served from cache without re-reading the file."""
+    import forven.data as fd
+
+    path = tmp_path / "ohlcv" / "BTC-USDT" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    _make_ohlcv(5).to_parquet(path)
+
+    _reset_coverage_cache()
+    first = fd.coverage_entry(path)
+    assert first["rows"] == 5
+
+    # A cache hit must not touch pyarrow/pandas readers at all.
+    with patch("forven.data.pq.read_metadata", side_effect=AssertionError("re-read on cache hit")):
+        cached = fd.coverage_entry(path)
+    assert cached == first
+
+
+def test_coverage_entry_invalidates_on_file_change(tmp_path):
+    """Rewriting the parquet (new mtime/size) refreshes the cached entry."""
+    import forven.data as fd
+
+    path = tmp_path / "ohlcv" / "BTC-USDT" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    _make_ohlcv(5).to_parquet(path)
+
+    _reset_coverage_cache()
+    assert fd.coverage_entry(path)["rows"] == 5
+
+    time.sleep(0.01)
+    _make_ohlcv(9).to_parquet(path)  # changes mtime + size
+    assert fd.coverage_entry(path)["rows"] == 9
+
+
+def test_get_coverage_prunes_deleted_series_from_cache(tmp_path):
+    """A removed parquet's cache entry is evicted on the next coverage sweep."""
+    import forven.data as fd
+
+    sym_dir = tmp_path / "ohlcv" / "BTC-USDT"
+    sym_dir.mkdir(parents=True)
+    keep = sym_dir / "1h.parquet"
+    drop = sym_dir / "5m.parquet"
+    _make_ohlcv(5).to_parquet(keep)
+    _make_ohlcv(5).to_parquet(drop)
+
+    _reset_coverage_cache()
+    with patch("forven.data.DATA_DIR", tmp_path / "ohlcv"):
+        with patch("forven.data_manager.FUNDING_DIR", tmp_path / "funding"):
+            with patch("forven.data_manager.OI_DIR", tmp_path / "oi"):
+                get_coverage()
+                assert str(drop) in fd._coverage_cache
+
+                drop.unlink()  # series removed (delete / delisting / re-upload)
+                result = get_coverage()
+
+    assert "ohlcv/5m" not in result["BTC-USDT"]
+    assert str(drop) not in fd._coverage_cache  # leaked entry evicted
+    assert str(keep) in fd._coverage_cache  # surviving series retained
+
+
+def test_coverage_entry_falls_back_without_statistics(tmp_path):
+    """Files written without column statistics still yield correct rows/dates."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import forven.data as fd
+
+    path = tmp_path / "ohlcv" / "NOSTATS" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pandas(_make_ohlcv(11)), path, write_statistics=False)
+
+    _reset_coverage_cache()
+    entry = fd.coverage_entry(path)
+    assert entry["rows"] == 11
+    assert entry["from"] == "2020-01-01"
 
 
 # ---------------------------------------------------------------------------

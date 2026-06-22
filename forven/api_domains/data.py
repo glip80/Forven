@@ -1777,27 +1777,20 @@ def get_coverage() -> dict:
     Scans data/ohlcv/, data/funding/, data/oi/ directories.
     Missing parquet files are omitted from the result.
     """
-    from forven.data import DATA_DIR
+    from forven.data import DATA_DIR, coverage_entry, prune_coverage_cache
     from forven.data_manager import FUNDING_DIR, OI_DIR
 
     result: dict = {}
     ohlcv_root = Path(DATA_DIR)
 
-    def _entry(df: pd.DataFrame) -> dict:
-        ts = pd.to_datetime(df["timestamp"], utc=True)
-        last = ts.max()
-        return {
-            "rows": len(df),
-            "from": ts.min().strftime("%Y-%m-%d"),
-            "to": last.strftime("%Y-%m-%d"),
-            # Precise last-bar timestamp so the coverage matrix can compute hour-
-            # granular, timeframe-aware freshness (a date-only "to" made intraday
-            # series look "current" for hours after their last bar closed).
-            "to_ts": last.isoformat(),
-        }
-
     if not ohlcv_root.exists():
         return result
+
+    visited: set[str] = set()
+
+    def _entry_for(path: Path) -> dict | None:
+        visited.add(str(path))
+        return coverage_entry(path)
 
     for sym_dir in sorted(ohlcv_root.iterdir()):
         if not sym_dir.is_dir() or sym_dir.name.startswith("."):
@@ -1807,33 +1800,31 @@ def get_coverage() -> dict:
 
         # OHLCV timeframes
         for pq_file in sorted(sym_dir.glob("*.parquet")):
-            try:
-                df = pd.read_parquet(pq_file, columns=["timestamp"])
-                result[symbol][f"ohlcv/{pq_file.stem}"] = _entry(df)
-            except Exception:
-                pass
+            entry = _entry_for(pq_file)
+            if entry is not None:
+                result[symbol][f"ohlcv/{pq_file.stem}"] = entry
 
         # Funding
         funding_path = FUNDING_DIR / symbol / "history.parquet"
         if funding_path.exists():
-            try:
-                df = pd.read_parquet(funding_path, columns=["timestamp"])
-                result[symbol]["funding"] = _entry(df)
-            except Exception:
-                pass
+            entry = _entry_for(funding_path)
+            if entry is not None:
+                result[symbol]["funding"] = entry
 
         # OI timeframes
         oi_sym_dir = OI_DIR / symbol
         if oi_sym_dir.exists():
             for pq_file in sorted(oi_sym_dir.glob("*.parquet")):
-                try:
-                    df = pd.read_parquet(pq_file, columns=["timestamp"])
-                    result[symbol][f"oi/{pq_file.stem}"] = _entry(df)
-                except Exception:
-                    pass
+                entry = _entry_for(pq_file)
+                if entry is not None:
+                    result[symbol][f"oi/{pq_file.stem}"] = entry
 
         if not result[symbol]:
             del result[symbol]
+
+    # Keep the per-file cache bounded to series that still exist (delistings,
+    # deletes and re-uploads otherwise leak entries in the long-lived worker).
+    prune_coverage_cache(visited)
 
     return result
 

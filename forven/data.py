@@ -155,6 +155,15 @@ _catalog_cache_lock = threading.Lock()
 _catalog_cache: dict[str, Any] = {"expires_at": 0.0, "datasets": []}
 _catalog_scan_lock = threading.Lock()
 
+# Coverage matrix entries are derived from parquet *footer metadata* (row count +
+# timestamp column statistics) rather than by loading whole timestamp columns. The
+# matrix rescans every stored series on each page visit; loading tens of millions
+# of timestamps held the GIL long enough to starve the single-worker event loop
+# and drop the live WebSocket. We cache each entry by (mtime_ns, size) so repeat
+# visits and unchanged series cost only a stat() call.
+_coverage_cache_lock = threading.Lock()
+_coverage_cache: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+
 _exchange_cache_lock = threading.Lock()
 _exchange_cache: dict[str, Any] = {}
 
@@ -856,6 +865,109 @@ def scan_datasets(force: bool = False) -> list[dict[str, Any]]:
             _catalog_cache["datasets"] = datasets
             _catalog_cache["expires_at"] = now + CATALOG_CACHE_TTL_SECONDS
     return [dict(item) for item in datasets]
+
+
+def _coverage_entry_uncached(path: Path) -> dict[str, Any] | None:
+    """Row count + date range for one parquet, read from footer metadata.
+
+    Mirrors ``_dataset_from_file``: the row count comes from the footer and the
+    timestamp min/max from per-row-group column statistics, so we never load the
+    timestamp column unless statistics are absent. Returns ``None`` for empty or
+    unreadable files (the matrix renders those as "not collected"), matching the
+    old behaviour where an empty frame raised and the key was skipped.
+    """
+    if _using_pyarrow():
+        metadata = pq.read_metadata(path)
+        rows = int(metadata.num_rows or 0)
+        if rows == 0:
+            return None
+        start = None
+        end = None
+        try:
+            names = list(metadata.schema.names)
+            if "timestamp" in names:
+                ts_idx = names.index("timestamp")
+                mins: list[Any] = []
+                maxes: list[Any] = []
+                for rg in range(metadata.num_row_groups):
+                    stats = getattr(metadata.row_group(rg).column(ts_idx), "statistics", None)
+                    if stats is None or not getattr(stats, "has_min_max", False):
+                        mins = []
+                        maxes = []
+                        break
+                    mins.append(stats.min)
+                    maxes.append(stats.max)
+                if mins and maxes:
+                    min_ts = _as_utc_timestamp(pd.Series(mins)).dropna().sort_values()
+                    max_ts = _as_utc_timestamp(pd.Series(maxes)).dropna().sort_values()
+                    start = min_ts.iloc[0] if len(min_ts) else None
+                    end = max_ts.iloc[-1] if len(max_ts) else None
+        except Exception:
+            start = None
+            end = None
+        if start is None or end is None:
+            ts = pq.read_table(path, columns=["timestamp"]).to_pandas()["timestamp"]
+            ts = _as_utc_timestamp(ts).dropna().sort_values()
+            if not len(ts):
+                return None
+            start = ts.iloc[0]
+            end = ts.iloc[-1]
+    else:
+        df = pd.read_parquet(path, columns=["timestamp"])
+        rows = len(df)
+        if rows == 0:
+            return None
+        ts = _as_utc_timestamp(df["timestamp"]).dropna().sort_values()
+        if not len(ts):
+            return None
+        start = ts.iloc[0]
+        end = ts.iloc[-1]
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    return {
+        "rows": rows,
+        "from": start_ts.strftime("%Y-%m-%d"),
+        "to": end_ts.strftime("%Y-%m-%d"),
+        # Precise last-bar timestamp so the matrix can compute hour-granular,
+        # timeframe-aware freshness.
+        "to_ts": _to_iso(end_ts),
+    }
+
+
+def coverage_entry(path: Path) -> dict[str, Any] | None:
+    """Cached per-file coverage entry, invalidated by the file's mtime + size."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = str(path)
+    mtime_ns = st.st_mtime_ns
+    size = st.st_size
+    with _coverage_cache_lock:
+        cached = _coverage_cache.get(key)
+        if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+            return dict(cached[2]) if cached[2] is not None else None
+    try:
+        entry = _coverage_entry_uncached(path)
+    except Exception:
+        entry = None
+    with _coverage_cache_lock:
+        _coverage_cache[key] = (mtime_ns, size, entry)
+    return dict(entry) if entry is not None else None
+
+
+def prune_coverage_cache(live_keys: set[str]) -> None:
+    """Drop cached entries for parquet paths no longer present.
+
+    The cache key is the file path, so a deleted, renamed or delisted series
+    (e.g. MATIC -> POL) would otherwise leave its tuple resident for the life of
+    the long-lived single-worker process. Callers pass the set of paths they just
+    visited so the cache stays bounded to currently-existing files.
+    """
+    with _coverage_cache_lock:
+        for key in [k for k in _coverage_cache if k not in live_keys]:
+            del _coverage_cache[key]
 
 
 def list_data_sources() -> list[dict[str, Any]]:
