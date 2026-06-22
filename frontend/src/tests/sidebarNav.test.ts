@@ -55,7 +55,7 @@ describe('Sidebar navigation', () => {
 		vi.clearAllMocks();
 	});
 
-	it('places Crucibles immediately after Data in the primary navigation', () => {
+	it('places Strategy Creator between Data and Crucibles in the primary navigation', () => {
 		app = mount(Sidebar, {
 			target,
 			props: { connectionStatus: 'connected' },
@@ -64,9 +64,11 @@ describe('Sidebar navigation', () => {
 		const links = Array.from(target.querySelectorAll('nav[aria-label="Primary navigation"] a[aria-label]'))
 			.map((node) => node.getAttribute('aria-label'));
 		const dataIndex = links.indexOf('Data');
+		const creatorIndex = links.indexOf('Strategy Creator');
 		const hypothesisIndex = links.indexOf('Crucibles');
 
 		expect(dataIndex).toBeGreaterThanOrEqual(0);
-		expect(hypothesisIndex).toBe(dataIndex + 1);
+		expect(creatorIndex).toBe(dataIndex + 1);
+		expect(hypothesisIndex).toBe(creatorIndex + 1);
 	});
 });

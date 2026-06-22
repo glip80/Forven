@@ -50,6 +50,7 @@ from forven.routers.ops import router as ops_router
 from forven.routers.paper import router as paper_router
 from forven.routers.status import router as status_router
 from forven.routers.strategies import router as strategies_router
+from forven.routers.strategy_library import router as strategy_library_router
 from forven.routers.system import router as system_router
 from forven.routers.tasks import router as tasks_router
 from forven.routers.trading import router as trading_router
@@ -595,6 +596,7 @@ app.include_router(agent_toolsets_router)
 app.include_router(routines_router)
 app.include_router(profile_router)
 app.include_router(strategies_router)
+app.include_router(strategy_library_router)
 app.include_router(websockets_router)
 app.include_router(quant_factory_router)
 # Webhooks are a GitHub-driven self-update path that shells out to `git` and

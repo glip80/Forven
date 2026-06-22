@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 
 from forven.strategies.base import BaseStrategy, DirectionalSignals, Signal
+from forven.strategies import indicators as _indicators
 
 TYPE_NAME = "rule_engine"
 
@@ -55,19 +56,10 @@ _RAW_COLUMNS = _OHLCV_COLUMNS | _ENRICHMENT_COLUMNS
 _OPERATORS = {"<", "<=", ">", ">=", "==", "!=", "crosses_above", "crosses_below"}
 
 # Indicator kind -> the param names it understands (for validation hints).
-INDICATOR_KINDS = {
-    "rsi": ["length"],
-    "ema": ["length"],
-    "sma": ["length"],
-    "wma": ["length"],
-    "macd": ["fast", "slow", "signal"],
-    "atr": ["length"],
-    "bollinger": ["length", "num_std"],
-    "stochastic": ["k", "d", "smooth"],
-    "roc": ["length"],
-    "momentum": ["length"],
-    "vwap": [],
-}
+# Sourced from the central indicator registry (forven.strategies.indicators) so
+# the no-code engine, the /api/indicators palette and the chart overlay builder
+# all agree on which kinds exist, their params and their output series names.
+INDICATOR_KINDS = _indicators.indicator_kinds()
 
 
 def _to_int(value, default: int) -> int:
@@ -86,90 +78,13 @@ def _to_float(value, default: float) -> float:
         return default
 
 
-def _rsi(close: pd.Series, length: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(length).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(length).mean()
-    # Clamp the denominator (matching scanner.rsi / funding_regime_reversion)
-    # so an all-gains window yields RSI≈100 instead of NaN — a NaN would fail
-    # every comparison and silently suppress overbought signals in strong trends.
-    rs = gain / loss.clip(lower=1e-9)
-    return 100 - (100 / (1 + rs))
-
-
-def _atr(df: pd.DataFrame, length: int) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / max(length, 1), adjust=False, min_periods=1).mean()
-
-
 def compute_indicator(df: pd.DataFrame, ind: dict) -> dict[str, pd.Series]:
-    """Compute one indicator spec into a dict of named output Series."""
-    kind = str(ind.get("kind") or "").strip().lower()
-    out_id = str(ind.get("id") or kind).strip()
-    p = ind.get("params") if isinstance(ind.get("params"), dict) else {}
-    close = df["close"].astype(float)
+    """Compute one indicator spec into a dict of named output Series.
 
-    if kind == "rsi":
-        return {out_id: _rsi(close, _to_int(p.get("length"), 14))}
-    if kind == "ema":
-        return {out_id: close.ewm(span=_to_int(p.get("length"), 20), adjust=False).mean()}
-    if kind == "sma":
-        return {out_id: close.rolling(_to_int(p.get("length"), 20)).mean()}
-    if kind == "wma":
-        n = _to_int(p.get("length"), 20)
-        weights = np.arange(1, n + 1)
-        return {out_id: close.rolling(n).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)}
-    if kind == "macd":
-        fast = close.ewm(span=_to_int(p.get("fast"), 12), adjust=False).mean()
-        slow = close.ewm(span=_to_int(p.get("slow"), 26), adjust=False).mean()
-        line = fast - slow
-        signal = line.ewm(span=_to_int(p.get("signal"), 9), adjust=False).mean()
-        return {out_id: line, f"{out_id}_signal": signal, f"{out_id}_hist": line - signal}
-    if kind == "atr":
-        return {out_id: _atr(df, _to_int(p.get("length"), 14))}
-    if kind == "bollinger":
-        n = _to_int(p.get("length"), 20)
-        num_std = _to_float(p.get("num_std"), 2.0)
-        mid = close.rolling(n).mean()
-        sd = close.rolling(n).std()
-        return {
-            f"{out_id}_mid": mid,
-            f"{out_id}_upper": mid + num_std * sd,
-            f"{out_id}_lower": mid - num_std * sd,
-            out_id: mid,
-        }
-    if kind == "stochastic":
-        k_len = _to_int(p.get("k"), 14)
-        d_len = _to_int(p.get("d"), 3)
-        smooth = _to_int(p.get("smooth"), 3)
-        low_n = df["low"].rolling(k_len).min()
-        high_n = df["high"].rolling(k_len).max()
-        raw_k = 100 * (close - low_n) / (high_n - low_n).replace(0, np.nan)
-        k = raw_k.rolling(smooth).mean()
-        d = k.rolling(d_len).mean()
-        return {f"{out_id}_k": k, f"{out_id}_d": d, out_id: k}
-    if kind == "roc":
-        return {out_id: close.pct_change(_to_int(p.get("length"), 10)) * 100.0}
-    if kind == "momentum":
-        return {out_id: close.diff(_to_int(p.get("length"), 10))}
-    if kind == "vwap":
-        tp = (df["high"] + df["low"] + df["close"]) / 3.0
-        vol = df["volume"].replace(0, np.nan)
-        length = _to_int(p.get("length"), 0)
-        if length > 0:
-            # Rolling VWAP over a window (anchored cumulative when no length given).
-            num = (tp * df["volume"]).rolling(length).sum()
-            den = vol.rolling(length).sum()
-        else:
-            num = (tp * df["volume"]).cumsum()
-            den = vol.cumsum()
-        return {out_id: num / den}
-
-    raise ValueError(f"Unknown indicator kind: '{kind}'")
+    Thin delegator to the central registry (forven.strategies.indicators) which
+    owns every indicator's vectorized math, parameters and output names.
+    """
+    return _indicators.compute_indicator(df, ind)
 
 
 def build_series_table(df: pd.DataFrame, spec: dict) -> dict[str, pd.Series]:
@@ -282,14 +197,7 @@ def eval_tree(tree, table: dict[str, pd.Series], params: dict, index: pd.Index) 
 
 def indicator_output_names(kind: str, out_id: str) -> list[str]:
     """The series names an indicator of this kind exposes (mirrors compute_indicator)."""
-    kind = str(kind or "").lower()
-    if kind == "macd":
-        return [out_id, f"{out_id}_signal", f"{out_id}_hist"]
-    if kind == "bollinger":
-        return [out_id, f"{out_id}_mid", f"{out_id}_upper", f"{out_id}_lower"]
-    if kind == "stochastic":
-        return [out_id, f"{out_id}_k", f"{out_id}_d"]
-    return [out_id]
+    return _indicators.output_names(kind, out_id)
 
 
 def _operand_error(operand, available: set[str], param_names: set[str]) -> str | None:

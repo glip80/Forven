@@ -3475,6 +3475,71 @@ def _indicator_points(frame: pd.DataFrame, column: str) -> list[dict]:
 
 
 
+def _build_rule_engine_chart_indicators(
+    frame: pd.DataFrame, params: dict | None, warnings: list[str]
+) -> tuple[list[dict], list[dict], list[str]]:
+    """Compute indicator overlays for a no-code rule_engine spec.
+
+    Unlike the hardcoded per-type overlays, this reads the visual spec's
+    indicator list, computes every output via the shared indicator registry, and
+    assigns each series to the price panel ('main') or a sub panel based on the
+    indicator's declared default panel. Powers both the live Strategy Creator
+    preview chart and the persisted result chart for visual strategies.
+    """
+    from forven.strategies.builtin.rule_engine import build_series_table, validate_rule_spec
+    from forven.strategies import indicators as _ind
+
+    spec = params.get("spec") if isinstance(params, dict) else None
+    if not isinstance(spec, dict):
+        warnings.append("Indicator overlay unavailable: rule spec missing.")
+        return [], [], warnings
+    spec_errors = validate_rule_spec(spec)
+    if spec_errors:
+        warnings.append(f"Indicator overlay unavailable: {spec_errors[0]}")
+        return [], [], warnings
+    try:
+        table = build_series_table(frame, spec)
+    except Exception as exc:
+        warnings.append(f"Indicator overlay generation failed: {exc}")
+        return [], [], warnings
+
+    enriched = frame.copy()
+    palette = [
+        "#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f97316",
+        "#60a5fa", "#f472b6", "#facc15", "#4ade80", "#fb7185",
+    ]
+    main_indicators: list[dict] = []
+    sub_indicators: list[dict] = []
+    color_idx = 0
+    for ind_spec in spec.get("indicators") or []:
+        if not isinstance(ind_spec, dict):
+            continue
+        kind = str(ind_spec.get("kind") or "").strip().lower()
+        out_id = str(ind_spec.get("id") or kind).strip()
+        if not out_id:
+            continue
+        panel = _ind.default_panel(kind)
+        seen_series: set[int] = set()
+        for name in _ind.output_names(kind, out_id):
+            if name.endswith("_dir"):
+                continue  # direction flags don't render as meaningful overlays
+            series = table.get(name)
+            if series is None:
+                continue
+            # Drop duplicate aliases (bare "bb" == "bb_mid", "stoch" == "stoch_k").
+            if id(series) in seen_series:
+                continue
+            seen_series.add(id(series))
+            enriched[name] = series
+            data = _indicator_points(enriched, name)
+            if not data:
+                continue
+            entry = {"name": name, "color": palette[color_idx % len(palette)], "data": data}
+            color_idx += 1
+            (main_indicators if panel == "main" else sub_indicators).append(entry)
+    return main_indicators, sub_indicators, warnings
+
+
 def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dict | None) -> tuple[list[dict], list[dict], list[str]]:
 
 
@@ -3488,6 +3553,10 @@ def _build_chart_indicators(frame: pd.DataFrame, strategy_type: str, params: dic
 
 
         return [], [], warnings
+
+
+    if normalized_type == "rule_engine":
+        return _build_rule_engine_chart_indicators(frame, params, warnings)
 
 
     if normalized_type not in _CHART_SUPPORTED_TYPES:
@@ -4080,6 +4149,114 @@ def build_backtest_chart_context(
 
 
 
+
+
+def build_strategy_preview_chart_context(
+    *,
+    asset: str,
+    timeframe: str,
+    start_date: str | None,
+    end_date: str | None,
+    spec: dict,
+    trade_mode: str = "long_only",
+    strategy_name: str = "Visual strategy",
+    max_markers: int = 600,
+) -> dict:
+    """Live preview chart for a no-code rule_engine spec.
+
+    Loads local candles, computes the spec's signals in-process (no backtest
+    run, no persistence) and returns bars + indicator overlays + entry/exit
+    markers in the same shape as :func:`build_backtest_chart_context`, so the
+    frontend can feed it straight into the shared chart workspace.
+    """
+    from forven.strategies.builtin.rule_engine import (
+        RuleEngineStrategy,
+        validate_rule_spec,
+        _spec_min_bars,
+    )
+
+    warnings: list[str] = []
+    resolved_asset = str(asset or "").strip().upper()
+    resolved_tf = str(timeframe or "1h").strip() or "1h"
+
+    if not isinstance(spec, dict):
+        return {
+            "bars": [], "entry_markers": [], "exit_markers": [],
+            "main_indicators": [], "sub_indicators": [],
+            "strategy_name": strategy_name, "strategy_meta": "",
+            "strategy_params": {}, "warnings": ["No rule spec provided."],
+        }
+
+    spec_errors = validate_rule_spec(spec)
+    if spec_errors:
+        warnings.extend(spec_errors[:5])
+
+    warmup = max(210, _spec_min_bars(spec))
+    frame, frame_warnings = _load_local_chart_frame(
+        asset=resolved_asset,
+        timeframe=resolved_tf,
+        start_date=start_date,
+        end_date=end_date,
+        warmup_bars=warmup,
+        allow_remote_fallback=True,
+    )
+    warnings.extend(frame_warnings)
+
+    entry_markers: list[dict] = []
+    exit_markers: list[dict] = []
+    main_indicators: list[dict] = []
+    sub_indicators: list[dict] = []
+
+    if not frame.empty and not spec_errors:
+        try:
+            strat = RuleEngineStrategy(
+                "rule_engine__preview", {"spec": spec, "_asset": resolved_asset}
+            )
+            signals = strat.generate_signals(frame)
+            allow_short = str(trade_mode or "long_only") != "long_only"
+            closes = frame["close"]
+
+            def _emit(mask, bucket, direction, label):
+                if mask is None:
+                    return
+                for ts in frame.index[mask.to_numpy()]:
+                    price = _coerce_chart_float(closes.loc[ts])
+                    stamp = _serialize_chart_timestamp(ts)
+                    if stamp and price is not None:
+                        bucket.append({
+                            "timestamp": stamp, "price": round(price, 8),
+                            "direction": direction, "label": label,
+                        })
+
+            _emit(signals.long_entries, entry_markers, "long", "Long")
+            _emit(signals.long_exits, exit_markers, "long", "Exit")
+            if allow_short:
+                _emit(signals.short_entries, entry_markers, "short", "Short")
+                _emit(signals.short_exits, exit_markers, "short", "Cover")
+        except Exception as exc:
+            warnings.append(f"Signal preview unavailable: {exc}")
+
+        m_ind, s_ind, ind_warnings = _build_chart_indicators(frame, "rule_engine", {"spec": spec})
+        main_indicators, sub_indicators = m_ind, s_ind
+        warnings.extend(ind_warnings)
+
+    # Cap markers so a per-keystroke live preview stays light.
+    if len(entry_markers) > max_markers:
+        entry_markers = entry_markers[-max_markers:]
+    if len(exit_markers) > max_markers:
+        exit_markers = exit_markers[-max_markers:]
+
+    return {
+        "bars": _frame_to_chart_bars(frame),
+        "entry_markers": entry_markers,
+        "exit_markers": exit_markers,
+        "main_indicators": main_indicators,
+        "sub_indicators": sub_indicators,
+        "strategy_name": str(strategy_name or "Visual strategy"),
+        "strategy_meta": _build_chart_strategy_meta(resolved_asset, resolved_tf, start_date, end_date),
+        "strategy_params": {"spec": spec},
+        "warnings": _dedupe_chart_messages(warnings),
+    }
 
 
 def build_backtest_chart_context_from_result_detail(result_detail: dict) -> dict:

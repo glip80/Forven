@@ -6,6 +6,30 @@ export {
 } from './core';
 
 export {
+	getIndicators,
+	previewStrategyChart,
+	nlToSpec,
+	listStrategyLibrary,
+	getLibraryStrategy,
+	createLibraryStrategy,
+	updateLibraryStrategy,
+	deleteLibraryStrategy,
+	duplicateLibraryStrategy,
+	sendLibraryStrategyToForge,
+	getSystemStrategyDetail,
+} from './strategyCreator';
+export type {
+	IndicatorMeta,
+	IndicatorParamMeta,
+	PreviewChartContext,
+	NlToSpecResponse,
+	LibraryStrategy,
+	LibraryStrategyInput,
+	SendLibraryToForgeResponse,
+	SystemStrategyDetail,
+} from './strategyCreator';
+
+export {
 	getUpdateStatus,
 	applyUpdate,
 } from './updates';
@@ -689,6 +713,12 @@ export {
 	stopPaperSession,
 	deletePaperSession,
 	closePaperPosition,
+	partialClosePaperPosition,
+	openManualPaperPosition,
+	adjustPaperStopLoss,
+	adjustPaperTakeProfit,
+	flipPaperPosition,
+	setPaperAutoManagement,
 	replayStep,
 	replaySeek,
 	replayPlay,
@@ -725,6 +755,7 @@ export type {
 	SessionIndicatorsResponse,
 	TradeMarker,
 	TradeMarkersResponse,
+	OpenManualPaperPositionOptions,
 } from './paper';
 
 export {
