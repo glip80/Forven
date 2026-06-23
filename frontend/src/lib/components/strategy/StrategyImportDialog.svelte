@@ -202,7 +202,16 @@
 							<div class="text-right text-gray-400">
 								{parsed.summary.backtests} backtests · {parsed.summary.trades} trades
 							</div>
+							<div class="text-gray-500">Source code</div>
+							<div class="text-right {parsed.summary.hasCode ? 'text-emerald-300' : 'text-gray-500'}">
+								{parsed.summary.hasCode ? `bundled${parsed.summary.codeModule ? ` (${parsed.summary.codeModule})` : ''}` : 'none (param-only)'}
+							</div>
 						</div>
+						{#if parsed.summary.hasCode}
+							<div class="mt-2 text-[10px] text-emerald-300/80">
+								Bundled custom code will be security-scanned and registered before the container is created.
+							</div>
+						{/if}
 						{#if parsed.summary.backtests > 0 || parsed.summary.trades > 0 || parsed.summary.events > 0}
 							<div class="mt-2 text-[10px] text-amber-300/80">
 								History, trades, and events are kept for reference but not replayed — only the definition is recreated.

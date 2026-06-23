@@ -1488,13 +1488,83 @@ EXPORT_VERSION = "1.0"
 SUPPORTED_EXPORT_VERSIONS = {"1.0"}
 
 
+def _resolve_container_source_code(strategy_type: str, source_ref: str | None) -> dict | None:
+    """Locate the custom ``.py`` backing a code-class container so an export can
+    bundle it. Returns ``{module_name, filename, content}`` or ``None`` for
+    param-family / built-in strategies (which carry no custom source file).
+
+    A code-class strategy's logic lives in a file under ``forven/strategies/custom/``
+    and cannot be reconstructed from params alone — without the source, a re-import
+    on another machine has no registered class for the runtime type.
+    """
+    import sys
+    from pathlib import Path
+
+    type_name = str(strategy_type or "").strip()
+    if not type_name:
+        return None
+    try:
+        from forven.strategies import custom, registry
+        custom_dir = Path(custom.__file__).resolve().parent
+    except Exception:
+        return None
+
+    source_path: Path | None = None
+    try:
+        if type_name not in registry._TYPE_MAP:
+            registry.discover(include_custom=True)
+        cls = registry._TYPE_MAP.get(type_name)
+        if cls is not None:
+            module = sys.modules.get(str(getattr(cls, "__module__", "") or ""))
+            module_file = getattr(module, "__file__", None)
+            if module_file:
+                candidate = Path(module_file).resolve()
+                try:
+                    candidate.relative_to(custom_dir)  # only bundle custom files, not built-ins
+                    source_path = candidate
+                except ValueError:
+                    source_path = None
+    except Exception:
+        source_path = None
+
+    if source_path is None:
+        ref = str(source_ref or "").strip()
+        if ref:
+            try:
+                candidate = Path(ref).expanduser().resolve()
+                if candidate.exists() and candidate.suffix.lower() == ".py":
+                    candidate.relative_to(custom_dir)
+                    source_path = candidate
+            except Exception:
+                source_path = None
+
+    if source_path is None or not source_path.exists():
+        return None
+    try:
+        content = source_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    if not content.strip():
+        return None
+    return {
+        "module_name": source_path.stem,
+        "filename": source_path.name,
+        "content": content,
+    }
+
+
 def build_container_export(strategy_id: str, exported_at: str | None = None) -> dict:
-    """Wrap the full container snapshot in a versioned, portable envelope."""
+    """Wrap the full container snapshot in a versioned, portable envelope.
+
+    For code-class strategies the backing custom ``.py`` is bundled under
+    ``source_code`` so the strategy can be fully recreated on another machine.
+    """
     container = get_strategy_container(strategy_id, result_limit=1000, trade_limit=20000)
     strat = container.get("strategy") if isinstance(container.get("strategy"), dict) else {}
+    config = container.get("configuration") if isinstance(container.get("configuration"), dict) else {}
     source_id = str((strat or {}).get("id") or strategy_id).strip()
     source_display = str((strat or {}).get("display_id") or source_id).strip()
-    return {
+    envelope = {
         "forven_export": {
             "kind": EXPORT_KIND,
             "version": EXPORT_VERSION,
@@ -1504,6 +1574,13 @@ def build_container_export(strategy_id: str, exported_at: str | None = None) -> 
         },
         **container,
     }
+    source_code = _resolve_container_source_code(
+        strategy_type=str((config or {}).get("type") or (strat or {}).get("type") or ""),
+        source_ref=str((strat or {}).get("source_ref") or ""),
+    )
+    if source_code:
+        envelope["source_code"] = source_code
+    return envelope
 
 
 def import_strategy_container(payload: object) -> dict:
@@ -1555,6 +1632,14 @@ def import_strategy_container(payload: object) -> dict:
             "only the strategy definition was recreated."
         )
 
+    # Code-class strategies bundle their source file. Re-register it through the
+    # intake security pipeline (banned-import gate + AST scan + lookahead probe)
+    # so the runtime class exists on this machine; param-family strategies skip
+    # this and are recreated from params alone.
+    source_code = payload.get("source_code") if isinstance(payload.get("source_code"), dict) else None
+    if source_code and str(source_code.get("content") or "").strip():
+        return _import_code_strategy(source_code, source_id, warnings)
+
     body = LifecycleCreateBody(
         name=name or None,
         source="import",
@@ -1567,11 +1652,18 @@ def import_strategy_container(payload: object) -> dict:
     result = create_lifecycle_strategy(body)
 
     if isinstance(result, dict) and result.get("ok") is False:
-        # Certification rejected the definition (e.g. an unregistered code-class
-        # runtime type that cannot be reconstructed from params alone).
+        # Certification rejected the definition — typically an unregistered
+        # code-class runtime type that cannot be reconstructed from params alone.
+        error = result.get("error") or "import rejected"
+        if not source_code:
+            error = (
+                f"{error} This export does not bundle the strategy's source code, "
+                "so its runtime class cannot be reconstructed here. Re-export from "
+                "the source machine — exports now include custom strategy code."
+            )
         return {
             "ok": False,
-            "error": result.get("error") or "import rejected",
+            "error": error,
             "warnings": warnings,
             "source_strategy_id": source_id or None,
         }
@@ -1585,7 +1677,21 @@ def import_strategy_container(payload: object) -> dict:
             "source_strategy_id": source_id or None,
         }
 
-    # Persist import attribution + keep any research-only reason create_lifecycle_strategy set.
+    stage = _apply_import_attribution(new_id, source_id, source_id or None)
+    return {
+        "ok": True,
+        "strategy_id": new_id,
+        "display_id": (result or {}).get("display_id") or new_id,
+        "stage": stage,
+        "state": (result or {}).get("state"),
+        "warnings": warnings,
+        "source_strategy_id": source_id or None,
+    }
+
+
+def _apply_import_attribution(new_id: str, source_id: str, source_ref: str | None) -> str | None:
+    """Stamp source=import + an 'Imported from …' note on a freshly created
+    container, preserving any research-only reason already set. Returns its stage."""
     stage = None
     with get_db() as conn:
         existing = conn.execute(
@@ -1597,15 +1703,105 @@ def import_strategy_container(payload: object) -> dict:
         merged_notes = (import_line + (("\n" + base_note) if base_note else "")).strip()
         conn.execute(
             "UPDATE strategies SET source = ?, source_ref = ?, notes = ?, updated_at = ? WHERE id = ?",
-            ("import", source_id or None, merged_notes or None, _now(), new_id),
+            ("import", source_ref, merged_notes or None, _now(), new_id),
+        )
+    return stage
+
+
+def _import_code_strategy(source_code: dict, source_id: str, warnings: list[str]) -> dict:
+    """Write a bundled custom strategy file and register it through the intake
+    security pipeline. Never overwrites a differing local file."""
+    import re as _re
+    from pathlib import Path
+
+    content = str(source_code.get("content") or "")
+    raw_module = str(source_code.get("module_name") or "").strip() or Path(
+        str(source_code.get("filename") or "")
+    ).stem
+    if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw_module):
+        raise HTTPException(
+            status_code=400, detail=f"invalid module name in export: {raw_module or '(none)'}"
         )
 
+    # Pre-write static guard so obviously-unsafe code never touches disk; the
+    # intake path re-scans (and adds the banned-import + lookahead gates) before
+    # importing.
+    try:
+        from forven.sandbox.ast_guard import scan_source
+
+        report = scan_source(content)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"security scan failed: {exc}") from exc
+    if not report.ok:
+        findings = "; ".join(f"line {f.lineno}: {f.message}" for f in report.findings[:5])
+        raise HTTPException(
+            status_code=400,
+            detail=f"imported strategy code rejected by security scan: {findings}",
+        )
+
+    from forven.strategies import custom
+    from forven.strategies.intake import register_custom_strategy_file
+
+    custom_dir = Path(custom.__file__).resolve().parent
+    target = custom_dir / f"{raw_module}.py"
+
+    wrote_file = False
+    if target.exists():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except Exception:
+            existing = None
+        if existing != content:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"a different strategy file already exists at custom/{raw_module}.py — "
+                    "rename or remove it before importing"
+                ),
+            )
+    else:
+        target.write_text(content, encoding="utf-8")
+        wrote_file = True
+
+    try:
+        reg = register_custom_strategy_file(file_path=str(target), source="import")
+    except ValueError as exc:
+        msg = str(exc)
+        if wrote_file:
+            try:
+                target.unlink()
+            except Exception:
+                pass
+        if "already registered" in msg.lower():
+            return {
+                "ok": False,
+                "error": f"This strategy is already present on this machine ({msg}).",
+                "warnings": warnings,
+                "source_strategy_id": source_id or None,
+            }
+        raise HTTPException(status_code=400, detail=f"import failed: {msg}") from exc
+
+    new_id = str((reg or {}).get("strategy_id") or "").strip()
+    if not new_id:
+        if wrote_file:
+            try:
+                target.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail="registration returned no strategy id")
+
+    stage = _apply_import_attribution(new_id, source_id, str(target))
+    if not bool((reg or {}).get("certified", True)):
+        cert_err = (reg or {}).get("certification_error")
+        warnings.append(
+            f"Registered as research-only{f': {cert_err}' if cert_err else ''}."
+        )
     return {
         "ok": True,
         "strategy_id": new_id,
-        "display_id": (result or {}).get("display_id") or new_id,
-        "stage": stage,
-        "state": (result or {}).get("state"),
+        "display_id": new_id,
+        "stage": stage or (reg or {}).get("stage"),
+        "state": None,
         "warnings": warnings,
         "source_strategy_id": source_id or None,
     }

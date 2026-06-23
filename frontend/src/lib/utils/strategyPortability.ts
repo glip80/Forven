@@ -80,6 +80,10 @@ export interface ParsedEnvelopeSummary {
 	backtests: number;
 	trades: number;
 	events: number;
+	/** True when the export bundles a custom strategy's source code. */
+	hasCode: boolean;
+	/** Module name of the bundled source, when present. */
+	codeModule: string;
 }
 
 export interface ParsedEnvelope {
@@ -127,6 +131,8 @@ export function parseEnvelope(text: string): ParsedEnvelope {
 	const strat = asRecord(env.strategy);
 	const history = asRecord(env.history);
 	const execution = asRecord(env.execution);
+	const sourceCode = asRecord(env.source_code);
+	const hasCode = typeof sourceCode.content === 'string' && sourceCode.content.trim().length > 0;
 
 	return {
 		envelope: env,
@@ -145,6 +151,8 @@ export function parseEnvelope(text: string): ParsedEnvelope {
 			backtests: countArray(history.backtests),
 			trades: countArray(execution.trades),
 			events: countArray(env.events),
+			hasCode,
+			codeModule: hasCode ? String(sourceCode.module_name ?? sourceCode.filename ?? '').trim() : '',
 		},
 	};
 }

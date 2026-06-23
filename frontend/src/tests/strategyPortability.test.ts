@@ -49,6 +49,25 @@ describe('parseEnvelope', () => {
 		expect(parsed.summary.backtests).toBe(2);
 		expect(parsed.summary.trades).toBe(1);
 		expect(parsed.summary.events).toBe(1);
+		expect(parsed.summary.hasCode).toBe(false);
+	});
+
+	it('detects bundled source code', () => {
+		const text = serializeEnvelope(
+			validEnvelope({
+				source_code: { module_name: 'my_custom', filename: 'my_custom.py', content: 'class X: pass' },
+			})
+		);
+		const parsed = parseEnvelope(text);
+		expect(parsed.summary.hasCode).toBe(true);
+		expect(parsed.summary.codeModule).toBe('my_custom');
+	});
+
+	it('treats empty source_code content as no code', () => {
+		const text = serializeEnvelope(
+			validEnvelope({ source_code: { module_name: 'x', filename: 'x.py', content: '   ' } })
+		);
+		expect(parseEnvelope(text).summary.hasCode).toBe(false);
 	});
 
 	it('throws on invalid JSON', () => {
