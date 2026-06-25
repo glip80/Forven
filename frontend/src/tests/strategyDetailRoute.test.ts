@@ -110,6 +110,8 @@ const pipelineSettings = {
 	failed_retention_hours: 24,
 	ranking_top_n: 10,
 	ranking_metric: 'sharpe_ratio',
+	backtest_fee_bps: 4.5,
+	backtest_slippage_bps: 2,
 	created_at: '2026-04-01T00:00:00Z',
 	created_by: 'brain',
 };
@@ -920,7 +922,8 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="backtest-parameter-panel"]')).not.toBeNull();
 		expect(target.textContent).toContain('Gauntlet Parameters');
 
-		const fastInput = target.querySelector<HTMLInputElement>('[data-testid="backtest-parameter-editor"] input[type="number"]');
+		const fastInput = Array.from(target.querySelectorAll<HTMLInputElement>('[data-testid="backtest-parameter-editor"] input[type="number"]'))
+			.find((input) => input.value === '12') ?? null;
 		setInputValue(fastInput, '15');
 		await flush();
 
@@ -934,6 +937,105 @@ describe('/lab/strategy/[id] backtest history', () => {
 				slow: 26,
 				signal: 9,
 			},
+		}));
+	});
+
+	it('expands compact backtest parameter summaries from the overflow chip', async () => {
+		const params = {
+			alpha: 1,
+			beta: 2,
+			delta: 4,
+			epsilon: 5,
+			gamma: 3,
+			leverage: 2,
+			theta: 7,
+			zeta: 6,
+		};
+		const container = buildContainer([], { params });
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				config: { params },
+			}),
+		];
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const summary = target.querySelector('[data-testid="backtest-param-summary-B1001"]');
+		expect(summary?.textContent).toContain('alpha=1');
+		expect(summary?.textContent).toContain('+4 more');
+		expect(summary?.textContent).not.toContain('gamma=3');
+
+		clickByTestId(target, 'backtest-param-overflow-B1001');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent?.includes('gamma=3') ?? false);
+		expect(target.querySelector('[data-testid="backtest-param-overflow-B1001"]')?.textContent).toContain('Show less');
+
+		clickByTestId(target, 'backtest-param-overflow-B1001');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent?.includes('+4 more') ?? false);
+		expect(target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent).not.toContain('gamma=3');
+	});
+
+	it('loads gauntlet execution settings from a selected history row and resets to defaults', async () => {
+		const container = buildContainer([], {
+			params: { fast: 12, slow: 26, signal: 9, leverage: 1 },
+		});
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				config: {
+					params: { fast: 15, slow: 30, signal: 8, leverage: 2 },
+					initial_capital: 25000,
+					fee_bps: 8,
+					slippage_bps: 4,
+					leverage: 2,
+					sizing_mode: 'fraction',
+					risk_per_trade: 0.03,
+					stop_loss_pct: 5,
+					take_profit_pct: 11,
+				},
+			}),
+		];
+		apiMocks.getStrategyContainer
+			.mockResolvedValueOnce(container)
+			.mockResolvedValueOnce(container);
+		apiMocks.submitBacktest.mockResolvedValue({ job_id: 'JOB-EXEC-1', status: 'succeeded' });
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		clickByTestId(target, 'backtest-row-B1001');
+		await waitForCondition(() => target.textContent?.includes('Run B1001') ?? false);
+		clickButtonByText(target, 'Run the Gauntlet');
+		await waitForCondition(() => apiMocks.submitBacktest.mock.calls.length > 0);
+
+		expect(apiMocks.submitBacktest).toHaveBeenCalledWith(expect.objectContaining({
+			params: expect.objectContaining({ fast: 15, slow: 30, signal: 8 }),
+			initial_capital: 25000,
+			fee_bps: 8,
+			slippage_bps: 4,
+			leverage: 2,
+			sizing_mode: 'fraction',
+			risk_per_trade: 0.03,
+			stop_loss_pct: 5,
+			take_profit_pct: 11,
+		}));
+
+		await waitForCondition(() => apiMocks.getStrategyContainer.mock.calls.length >= 2);
+		await waitForCondition(() => target.textContent?.includes('Run B1001') ?? false);
+		apiMocks.submitBacktest.mockClear();
+		clickByTestId(target, 'backtest-params-reset');
+		await waitForCondition(() => target.textContent?.includes('Container defaults') ?? false);
+		clickButtonByText(target, 'Run the Gauntlet');
+		await waitForCondition(() => apiMocks.submitBacktest.mock.calls.length > 0);
+
+		expect(apiMocks.submitBacktest).toHaveBeenCalledWith(expect.objectContaining({
+			params: expect.objectContaining({ fast: 12, slow: 26, signal: 9, leverage: 1 }),
+			initial_capital: 10000,
+			fee_bps: 4.5,
+			slippage_bps: 2,
+			sizing_mode: 'full',
 		}));
 	});
 
