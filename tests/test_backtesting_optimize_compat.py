@@ -499,7 +499,7 @@ def test_backtesting_client_sends_forven_api_and_operator_keys(monkeypatch):
 def test_optimize_strategy_uses_explicit_parameter_ranges(monkeypatch):
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None, execution_controls=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {
@@ -534,7 +534,7 @@ def test_optimize_strategy_uses_explicit_parameter_ranges(monkeypatch):
 def test_optimize_strategy_normalizes_frontend_parameter_range_dicts(monkeypatch):
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None, execution_controls=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {
@@ -563,6 +563,98 @@ def test_optimize_strategy_normalizes_frontend_parameter_range_dicts(monkeypatch
 
     assert captured["param_space"] == {"rsi_length": [5, 8, 11, 14]}
     assert result["best_params"] == {"rsi_length": 8}
+    assert result["validated"] is True
+
+
+def test_optimize_strategy_honors_execution_ranges_objective_window_and_base_params(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
+        captured["grid"] = {
+            "strategy_id": strategy_id,
+            "asset": asset,
+            "strategy_type": strategy_type,
+            "param_space": param_space,
+            **kwargs,
+        }
+        return [
+            {
+                "params": {"rsi_length": 8},
+                "full_params": {"rsi_length": 8, "threshold": 20, "leverage": 4},
+                "execution_controls": {"stop_loss_pct": 3.0},
+                "full_execution_controls": {
+                    "sizing_mode": "fraction",
+                    "risk_per_trade": 0.02,
+                    "stop_loss_pct": 3.0,
+                },
+                "metrics": {"total_trades": 12, "sharpe": 1.1, "total_return_pct": 9.5},
+                "fitness": 55.0,
+                "objective": "total_return_pct",
+                "objective_value": 9.5,
+                "trades": 12,
+            }
+        ]
+
+    def _fake_walk_forward(**kwargs):
+        captured["wfa"] = kwargs
+        return {"verdict": "PASS", "degradation": 0.1}
+
+    monkeypatch.setattr("forven.strategies.optimizer.grid_search", _fake_grid_search)
+    monkeypatch.setattr("forven.strategies.optimizer.walk_forward", _fake_walk_forward)
+    monkeypatch.setattr("forven.api_core.get_settings", lambda: {"backtest_duration_days": 365})
+    monkeypatch.setattr("forven.vectordb.store_backtest_result", lambda **_kwargs: None)
+
+    result = optimize_strategy(
+        strategy_id="S-execution-real",
+        asset="BTC",
+        strategy_type="rsi_momentum",
+        bars=240,
+        timeframe="4h",
+        param_space={"rsi_length": [8, 14]},
+        base_params={"rsi_length": 14, "threshold": 20, "leverage": 2},
+        objective="total_return_pct",
+        n_trials=7,
+        start_date="2025-01-01T00:00:00Z",
+        end_date="2025-06-01T00:00:00Z",
+        execution_profile={"sizing_mode": "fraction", "risk_per_trade": 0.02},
+        execution_param_space={"stop_loss_pct": {"min": 2.0, "max": 3.0, "step": 1.0}},
+        fee_bps=8.0,
+        slippage_bps=4.0,
+        initial_capital=25_000.0,
+    )
+
+    grid = captured["grid"]
+    assert grid["param_space"] == {"rsi_length": [8, 14]}
+    assert grid["base_params"] == {"rsi_length": 14, "threshold": 20, "leverage": 2}
+    assert grid["execution_controls"] == {"sizing_mode": "fraction", "risk_per_trade": 0.02}
+    assert grid["execution_param_space"] == {"stop_loss_pct": [2.0, 3.0]}
+    assert grid["objective"] == "total_return_pct"
+    assert grid["max_trials"] == 7
+    assert grid["timeframe"] == "4h"
+    assert grid["start_date"] == "2025-01-01T00:00:00Z"
+    assert grid["end_date"] == "2025-06-01T00:00:00Z"
+    assert grid["fee_bps"] == 8.0
+    assert grid["slippage_bps"] == 4.0
+    assert grid["initial_capital"] == 25_000.0
+
+    wfa = captured["wfa"]
+    assert wfa["params"] == {"rsi_length": 8, "threshold": 20, "leverage": 4}
+    assert wfa["execution_controls"] == {
+        "sizing_mode": "fraction",
+        "risk_per_trade": 0.02,
+        "stop_loss_pct": 3.0,
+    }
+    assert wfa["timeframe"] == "4h"
+    assert wfa["start_date"] == "2025-01-01T00:00:00Z"
+    assert wfa["end_date"] == "2025-06-01T00:00:00Z"
+    assert wfa["leverage"] == 4.0
+
+    assert result["best_params"] == {"rsi_length": 8}
+    assert result["best_full_params"] == {"rsi_length": 8, "threshold": 20, "leverage": 4}
+    assert result["best_execution_controls"] == {"stop_loss_pct": 3.0}
+    assert result["best_execution_profile"]["stop_loss_pct"] == 3.0
+    assert result["best_objective"] == "total_return_pct"
+    assert result["best_objective_value"] == 9.5
     assert result["validated"] is True
 
 
@@ -635,7 +727,7 @@ def test_optimize_strategy_explicit_risk_axes_survive(monkeypatch):
     # deliberate request — it must reach grid_search and best_params untouched.
     captured: dict[str, object] = {}
 
-    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, bars=None, leverage=3.0, timeframe=None, execution_controls=None):
+    def _fake_grid_search(strategy_id, asset, strategy_type, param_space, **kwargs):
         captured["param_space"] = param_space
         return [
             {

@@ -7716,7 +7716,16 @@ def backtest_strategy(
     if candles_df is not None and not candles_df.empty:
 
 
-        df = candles_df.tail(resolved_bars) if len(candles_df) > resolved_bars else candles_df
+        df = candles_df
+        if start_date or end_date:
+            df = _filter_backtest_frame_to_window(
+                df,
+                start_date=start_date,
+                end_date=end_date,
+                warmup_bars=210,
+            )
+        elif len(df) > resolved_bars:
+            df = df.tail(resolved_bars)
 
 
     else:
@@ -9492,6 +9501,8 @@ def walk_forward(
 
     end_date: str | None = None,
 
+    timeframe: str | None = None,
+
 
     trade_mode: TradeMode | None = None,
 
@@ -9662,7 +9673,7 @@ def walk_forward(
     if trade_mode_error:
         return {"error": trade_mode_error}
 
-    resolved_timeframe = str(params.get("timeframe") or settings.get("backtest_timeframe") or "1h").strip() or "1h"
+    resolved_timeframe = str(timeframe or params.get("timeframe") or settings.get("backtest_timeframe") or "1h").strip() or "1h"
 
 
 

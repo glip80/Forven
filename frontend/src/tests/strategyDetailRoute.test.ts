@@ -846,6 +846,50 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="opt-param-select-zero"]')).not.toBeNull();
 	});
 
+	it('selects and clears every optimization parameter via the select-all checkbox', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], { params: { fast: 12, slow: 26, signal: 9 } }),
+		);
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		const panel = () => target.querySelector('[data-testid="optimization-params-panel"]') as HTMLElement | null;
+		const selectAll = () => target.querySelector('[data-testid="opt-param-select-all"]') as HTMLInputElement | null;
+		const paramBox = (key: string) =>
+			target.querySelector(`[data-testid="opt-param-select-${key}"]`) as HTMLInputElement | null;
+
+		// Nothing selected on load.
+		expect(selectAll()).not.toBeNull();
+		expect(selectAll()?.checked).toBe(false);
+		expect(selectAll()?.indeterminate).toBe(false);
+		expect(panel()?.textContent).toContain('0 selected');
+
+		// Select all -> every param checkbox checked, header count reflects it.
+		clickByTestId(target, 'opt-param-select-all');
+		await waitForCondition(() => panel()?.textContent?.includes('3 selected') ?? false);
+		expect(paramBox('fast')?.checked).toBe(true);
+		expect(paramBox('slow')?.checked).toBe(true);
+		expect(paramBox('signal')?.checked).toBe(true);
+		expect(selectAll()?.checked).toBe(true);
+		expect(selectAll()?.indeterminate).toBe(false);
+
+		// Toggle select-all off -> everything cleared (clean toggle: it was fully checked).
+		clickByTestId(target, 'opt-param-select-all');
+		await waitForCondition(() => panel()?.textContent?.includes('0 selected') ?? false);
+		expect(paramBox('fast')?.checked).toBe(false);
+		expect(paramBox('slow')?.checked).toBe(false);
+		expect(paramBox('signal')?.checked).toBe(false);
+		expect(selectAll()?.checked).toBe(false);
+		expect(selectAll()?.indeterminate).toBe(false);
+
+		// Selecting a single param puts select-all into the indeterminate (some, not all) state.
+		clickByTestId(target, 'opt-param-select-signal');
+		await waitForCondition(() => selectAll()?.indeterminate === true);
+		expect(selectAll()?.checked).toBe(false);
+		expect(panel()?.textContent).toContain('1 selected');
+	});
+
 	it('submits selected optimization parameter ranges', async () => {
 		apiMocks.getStrategyContainer.mockResolvedValue(
 			buildContainer([], {
@@ -853,6 +897,15 @@ describe('/lab/strategy/[id] backtest history', () => {
 					fast: 12,
 					slow: 26,
 					signal: 9,
+					execution_profile: {
+						initial_capital: 10000,
+						fee_bps: 10,
+						slippage_bps: 5,
+						leverage: 2,
+						sizing_mode: 'fraction',
+						risk_per_trade: 0.01,
+						stop_loss_pct: 2,
+					},
 				},
 			}),
 		);
@@ -860,6 +913,12 @@ describe('/lab/strategy/[id] backtest history', () => {
 
 		app = mount(StrategyDetailPage, { target });
 		await openRobustnessTab(target);
+
+		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-timeframe'), '4h');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-start'), '2025-01-15');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-end'), '2025-03-15');
+		setSelectValue(target.querySelector<HTMLSelectElement>('#container-opt-objective'), 'total_return_pct');
+		setInputValue(target.querySelector<HTMLInputElement>('#container-opt-trials'), '25');
 
 		clickByTestId(target, 'opt-param-select-fast');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
@@ -869,6 +928,15 @@ describe('/lab/strategy/[id] backtest history', () => {
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-signal"]'), '5');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-max-signal"]'), '11');
 		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-step-signal"]'), '1');
+		await waitForCondition(() => target.querySelector('[data-testid="opt-exec-select-leverage"]') !== null);
+		clickByTestId(target, 'opt-exec-select-leverage');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-leverage"]'), '1');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-leverage"]'), '3');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-leverage"]'), '1');
+		clickByTestId(target, 'opt-exec-select-stop_loss_pct');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-min-stop_loss_pct"]'), '1');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-max-stop_loss_pct"]'), '4');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-exec-step-stop_loss_pct"]'), '1');
 		await flush();
 
 		clickButtonByText(target, 'Run Optimization');
@@ -878,12 +946,67 @@ describe('/lab/strategy/[id] backtest history', () => {
 			strategy_id: 'S0001',
 			strategy_name: 'BTC-MACD-S0001',
 			symbol: 'BTC/USDT',
-			timeframe: '1h',
+			timeframe: '4h',
+			start: '2025-01-15T00:00:00.000Z',
+			end: '2025-03-15T00:00:00.000Z',
+			objective: 'total_return_pct',
+			n_trials: 25,
 			parameter_ranges: {
 				fast: { min: 10, max: 20, step: 2 },
 				signal: { min: 5, max: 11, step: 1 },
 			},
+			execution_parameter_ranges: {
+				leverage: { min: 1, max: 3, step: 1 },
+				stop_loss_pct: { min: 1, max: 4, step: 1 },
+			},
+			execution_profile: expect.objectContaining({
+				initial_capital: 10000,
+				fee_bps: 10,
+				slippage_bps: 5,
+				leverage: 2,
+				sizing_mode: 'fraction',
+				risk_per_trade: 0.01,
+				stop_loss_pct: 2,
+			}),
+			leverage: 2,
+			stop_loss_pct: 2,
 		}));
+	});
+
+	it('normalizes legacy zero leverage params before optimization submit', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(
+			buildContainer([], {
+				params: {
+					fast: 12,
+					slow: 26,
+					signal: 9,
+					leverage: 0,
+				},
+			}),
+		);
+		apiMocks.submitOptimization.mockResolvedValue({ job_id: 'OPT-JOB-LEGACY-LEV', status: 'succeeded' });
+
+		app = mount(StrategyDetailPage, { target });
+		await openRobustnessTab(target);
+
+		clickByTestId(target, 'opt-param-select-fast');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-min-fast"]'), '10');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-max-fast"]'), '20');
+		setInputValue(target.querySelector<HTMLInputElement>('[data-testid="opt-param-step-fast"]'), '2');
+		await flush();
+
+		clickButtonByText(target, 'Run Optimization');
+		await waitForCondition(() => apiMocks.submitOptimization.mock.calls.length > 0);
+
+		const payload = apiMocks.submitOptimization.mock.calls[0][0];
+		expect(payload).toEqual(expect.objectContaining({
+			strategy_id: 'S0001',
+			leverage: 1,
+			execution_profile: expect.objectContaining({
+				leverage: 1,
+			}),
+		}));
+		expect(target.textContent).not.toContain('Leverage must be greater than 0 and no more than 125.');
 	});
 
 	it('blocks optimization submit when a selected range is invalid', async () => {

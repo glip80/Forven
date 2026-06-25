@@ -385,6 +385,7 @@ class BacktestingClient:
         parameter_ranges: dict,
         objective: str = "sharpe_ratio",
         n_trials: int = 50,
+        **kwargs,
     ) -> dict:
         """Run parameter optimization."""
         payload = {
@@ -394,6 +395,9 @@ class BacktestingClient:
             "objective": objective,
             "n_trials": n_trials,
         }
+        for key, value in kwargs.items():
+            if value is not None:
+                payload[key] = value
         resp = self._client.post("/backtesting/optimize", json=payload)
         resp.raise_for_status()
         return resp.json()

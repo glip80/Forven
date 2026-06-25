@@ -3235,8 +3235,22 @@ class OptimizationSubmitBody(BaseModel):
     # Per-stage window override (calendar days); see BacktestSubmitBody.duration_days.
     duration_days: int | None = Field(default=None, ge=0, le=36500)
     definition_json: dict | None = None
+    initial_capital: float | None = Field(default=None, gt=0, le=1e12)
     fee_bps: float | None = Field(default=None, ge=0, le=1000)
     slippage_bps: float | None = Field(default=None, ge=0, le=1000)
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    sizing_mode: str | None = None
+    fixed_size: float | None = Field(default=None, gt=0, le=1e12)
+    risk_per_trade: float | None = Field(default=None, gt=0, le=1)
+    atr_stop_multiplier: float | None = Field(default=None, gt=0, le=50)
+    kelly_multiplier: float | None = Field(default=None, gt=0, le=5)
+    kelly_lookback: int | None = Field(default=None, ge=1, le=100_000)
+    stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
+    take_profit_pct: float | None = Field(default=None, gt=0, le=1000)
+    trailing_stop_pct: float | None = Field(default=None, gt=0, le=100)
+    time_stop_bars: int | None = Field(default=None, ge=1, le=1_000_000)
+    execution_profile: dict | None = None
+    execution_parameter_ranges: dict | None = None
     lifecycle_id: str | None = None
 
 
@@ -10850,6 +10864,11 @@ def post_optimization_submit(body: OptimizationSubmitBody):
             end_dt = end_dt.replace(tzinfo=timezone.utc)
         opt_start_placeholder = (end_dt - timedelta(days=max(duration_days, 1))).isoformat()
 
+    body_execution_profile = dict(body.execution_profile) if isinstance(body.execution_profile, dict) else {}
+    body_execution_profile.update(_collect_honored_backtest_execution_controls(body))
+    body_execution_profile = {k: v for k, v in body_execution_profile.items() if v is not None}
+    execution_parameter_ranges = body.execution_parameter_ranges if isinstance(body.execution_parameter_ranges, dict) else None
+
     # Persist a placeholder row so the UI can see a "running" optimization.
     placeholder_config: dict[str, object] = {
         "strategy_id": strategy_id,
@@ -10862,8 +10881,13 @@ def post_optimization_submit(body: OptimizationSubmitBody):
         "base_params": base_params,
         "objective": body.objective,
         "n_trials": body.n_trials,
+        "initial_capital": body.initial_capital,
         "fee_bps": body.fee_bps,
         "slippage_bps": body.slippage_bps,
+        "leverage": body.leverage,
+        "execution_profile": body_execution_profile or None,
+        "execution_parameter_ranges": execution_parameter_ranges,
+        "parameter_ranges": body.parameter_ranges if isinstance(body.parameter_ranges, dict) else None,
         "job_id": job_id,
         "status": "running",
     }
@@ -10938,7 +10962,18 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 strategy_type=strategy_type,
                 bars=bars,
                 param_space=param_space,
+                base_params=base_params,
                 timeframe=timeframe,
+                objective=body_objective,
+                n_trials=body.n_trials,
+                start_date=body_start,
+                end_date=body_end,
+                execution_profile=body_execution_profile or None,
+                execution_param_space=execution_parameter_ranges,
+                fee_bps=body.fee_bps,
+                slippage_bps=body.slippage_bps,
+                initial_capital=body.initial_capital,
+                leverage=body.leverage,
             )
 
             if not isinstance(opt_result, dict) or opt_result.get("error"):
@@ -10956,8 +10991,12 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 return
 
             best_params = opt_result.get("best_params", {})
+            best_full_params = opt_result.get("best_full_params", {})
+            best_execution_controls = opt_result.get("best_execution_controls", {})
+            best_execution_profile = opt_result.get("best_execution_profile", {})
             best_metrics = opt_result.get("best_metrics", {})
             best_fitness = _coerce_float(opt_result.get("best_fitness"), 0.0)
+            best_objective_value = _coerce_float(opt_result.get("best_objective_value"), best_fitness)
 
             optimization_start = str(body_start or best_metrics.get("start_date") or best_metrics.get("start") or opt_start_placeholder).strip()
             optimization_end = str(body_end or best_metrics.get("end_date") or best_metrics.get("end") or opt_end_placeholder).strip()
@@ -10971,12 +11010,22 @@ def post_optimization_submit(body: OptimizationSubmitBody):
                 "start": optimization_start,
                 "end": optimization_end,
                 "params": best_params,
+                "best_params": best_params,
+                "best_full_params": best_full_params if isinstance(best_full_params, dict) else None,
                 "base_params": base_params,
                 "objective": body_objective,
                 "n_trials": body.n_trials,
+                "initial_capital": body.initial_capital,
                 "fee_bps": placeholder_config.get("fee_bps"),
                 "slippage_bps": placeholder_config.get("slippage_bps"),
+                "leverage": body.leverage,
+                "base_execution_profile": body_execution_profile or None,
+                "best_execution_controls": best_execution_controls if isinstance(best_execution_controls, dict) else None,
+                "execution_profile": best_execution_profile if isinstance(best_execution_profile, dict) else None,
+                "execution_parameter_ranges": execution_parameter_ranges,
+                "parameter_ranges": param_space,
                 "best_fitness": best_fitness,
+                "best_objective_value": best_objective_value,
                 "wfa_verdict": opt_result.get("wfa_verdict"),
                 "validated": opt_result.get("validated"),
                 "top_results": opt_result.get("top_results"),
@@ -10987,7 +11036,10 @@ def post_optimization_submit(body: OptimizationSubmitBody):
 
             metrics_for_storage = dict(best_metrics) if isinstance(best_metrics, dict) else {}
             metrics_for_storage["best_fitness"] = float(best_fitness)
+            metrics_for_storage["best_objective_value"] = float(best_objective_value)
             metrics_for_storage["status"] = "succeeded"
+            if isinstance(best_params, dict):
+                metrics_for_storage["best_params"] = best_params
             if body.n_trials is not None:
                 metrics_for_storage.setdefault("n_trials", int(body.n_trials))
             if body_objective is not None:

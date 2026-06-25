@@ -136,6 +136,7 @@
 		trailing_stop_pct: string;
 		time_stop_bars: string;
 	};
+	const DEFAULT_EXECUTION_LEVERAGE = '1';
 
 	let strategyId = '';
 	let returnTo = '/lab';
@@ -195,6 +196,8 @@
 	let prebuiltLoadSequence = 0;
 	let optimizationParamDrafts: Record<string, OptimizationParamDraft> = {};
 	let optimizationParamDraftSource = '';
+	let optimizationExecutionDrafts: Record<string, OptimizationParamDraft> = {};
+	let optimizationExecutionDraftSource = '';
 	let parameterSaveMessage = '';
 	let parameterSaveError = '';
 	let availableDatasets: Dataset[] = [];
@@ -427,6 +430,17 @@
 					? 'This draft has local changes and the next backtest will use them immediately.'
 					: 'The working draft matches the saved defaults for this strategy.';
 	$: syncOptimizationParamDrafts(strategyParams);
+	$: syncOptimizationExecutionDrafts(executionDraft);
+	$: optimizationParamSelectedCount = Object.values(optimizationParamDrafts).filter((draft) => draft.selected).length;
+	$: optimizationExecutionSelectedCount = Object.values(optimizationExecutionDrafts).filter((draft) => draft.selected).length;
+	$: allOptimizationParamsSelected =
+		Object.keys(optimizationParamDrafts).length > 0 &&
+		optimizationParamSelectedCount === Object.keys(optimizationParamDrafts).length;
+	$: someOptimizationParamsSelected = optimizationParamSelectedCount > 0 && !allOptimizationParamsSelected;
+	$: allOptimizationExecutionSelected =
+		Object.keys(optimizationExecutionDrafts).length > 0 &&
+		optimizationExecutionSelectedCount === Object.keys(optimizationExecutionDrafts).length;
+	$: someOptimizationExecutionSelected = optimizationExecutionSelectedCount > 0 && !allOptimizationExecutionSelected;
 	$: syncBacktestParamDrafts(backtestHistory);
 	$: orderedRecentEvents = sortLifecycleEventsDescending(recentEvents);
 	$: latestLifecycleEvent = orderedRecentEvents[0] ?? null;
@@ -897,6 +911,15 @@
 		return Number.isFinite(parsed) ? parsed : undefined;
 	}
 
+	function leverageDraftValue(value: unknown, fallback = DEFAULT_EXECUTION_LEVERAGE): string {
+		const text = String(value ?? '').trim();
+		const parsed = text ? Number(text) : Number.NaN;
+		if (Number.isFinite(parsed) && parsed > 0 && parsed <= 125) return String(parsed);
+		const fallbackParsed = Number(fallback);
+		if (Number.isFinite(fallbackParsed) && fallbackParsed > 0 && fallbackParsed <= 125) return String(fallbackParsed);
+		return DEFAULT_EXECUTION_LEVERAGE;
+	}
+
 	function validSizingMode(value: unknown): SizingMode {
 		const normalized = String(value ?? '').trim().toLowerCase();
 		if (normalized === 'fraction' || normalized === 'fixed' || normalized === 'atr' || normalized === 'kelly') return normalized;
@@ -908,7 +931,7 @@
 			initial_capital: '10000',
 			fee_bps: '4.5',
 			slippage_bps: '2',
-			leverage: '',
+			leverage: DEFAULT_EXECUTION_LEVERAGE,
 			sizing_mode: 'full',
 			risk_per_trade: '0.02',
 			fixed_size: '',
@@ -929,7 +952,7 @@
 			initial_capital: numberDraftValue(source.initial_capital, base.initial_capital),
 			fee_bps: numberDraftValue(source.fee_bps, base.fee_bps),
 			slippage_bps: numberDraftValue(source.slippage_bps, base.slippage_bps),
-			leverage: numberDraftValue(source.leverage, base.leverage),
+			leverage: leverageDraftValue(source.leverage, base.leverage),
 			sizing_mode: validSizingMode(source.sizing_mode ?? base.sizing_mode),
 			risk_per_trade: numberDraftValue(source.risk_per_trade, base.risk_per_trade),
 			fixed_size: numberDraftValue(source.fixed_size, base.fixed_size),
@@ -992,10 +1015,12 @@
 		const payload: Record<string, unknown> = {
 			sizing_mode: draft.sizing_mode,
 		};
-		for (const key of ['initial_capital', 'fee_bps', 'slippage_bps', 'leverage'] as const) {
+		for (const key of ['initial_capital', 'fee_bps', 'slippage_bps'] as const) {
 			const value = optionalNumber(draft[key]);
 			if (value !== undefined) payload[key] = value;
 		}
+		const leverage = optionalNumber(draft.leverage);
+		if (leverage !== undefined && leverage > 0 && leverage <= 125) payload.leverage = leverage;
 		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
 			const risk = optionalNumber(draft.risk_per_trade);
 			if (risk !== undefined) payload.risk_per_trade = risk;
@@ -2263,6 +2288,52 @@
 		optimizationParamDraftSource = source;
 	}
 
+	function optimizationExecutionValues(draft: ExecutionProfileDraft): Record<string, number> {
+		const values: Record<string, number> = {};
+		const alwaysAvailable = ['leverage', 'stop_loss_pct', 'take_profit_pct', 'trailing_stop_pct', 'time_stop_bars'] as const;
+		for (const key of alwaysAvailable) {
+			const value = optionalNumber(draft[key]);
+			if (value !== undefined) values[key] = value;
+		}
+		if (draft.sizing_mode === 'fraction' || draft.sizing_mode === 'atr') {
+			const value = optionalNumber(draft.risk_per_trade);
+			if (value !== undefined) values.risk_per_trade = value;
+		}
+		if (draft.sizing_mode === 'fixed') {
+			const value = optionalNumber(draft.fixed_size);
+			if (value !== undefined) values.fixed_size = value;
+		}
+		if (draft.sizing_mode === 'atr') {
+			const value = optionalNumber(draft.atr_stop_multiplier);
+			if (value !== undefined) values.atr_stop_multiplier = value;
+		}
+		if (draft.sizing_mode === 'kelly') {
+			const multiplier = optionalNumber(draft.kelly_multiplier);
+			const lookback = optionalNumber(draft.kelly_lookback);
+			if (multiplier !== undefined) values.kelly_multiplier = multiplier;
+			if (lookback !== undefined) values.kelly_lookback = lookback;
+		}
+		return values;
+	}
+
+	function syncOptimizationExecutionDrafts(draft: ExecutionProfileDraft): void {
+		const entries = Object.entries(optimizationExecutionValues(draft));
+		const source = stableStringify(Object.fromEntries(entries));
+		if (source === optimizationExecutionDraftSource) return;
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, value] of entries) {
+			const existing = optimizationExecutionDrafts[key];
+			const kind = optimizationParamKind(value);
+			if (existing && existing.current === value && existing.kind === kind) {
+				nextDrafts[key] = existing;
+				continue;
+			}
+			nextDrafts[key] = createOptimizationParamDraft(key, value);
+		}
+		optimizationExecutionDrafts = nextDrafts;
+		optimizationExecutionDraftSource = source;
+	}
+
 	function parseOptimizationParamValue(rawValue: string): number | null {
 		if (!rawValue.trim()) return null;
 		const parsed = Number(rawValue);
@@ -2297,6 +2368,43 @@
 		};
 	}
 
+	function setAllOptimizationParamsSelected(selected: boolean) {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, draft] of Object.entries(optimizationParamDrafts)) {
+			nextDrafts[key] = {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationParamDraft(draft) : '',
+			};
+		}
+		optimizationParamDrafts = nextDrafts;
+	}
+
+	function setOptimizationExecutionSelected(key: string, selected: boolean): void {
+		const draft = optimizationExecutionDrafts[key];
+		if (!draft) return;
+		optimizationExecutionDrafts = {
+			...optimizationExecutionDrafts,
+			[key]: {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationParamDraft(draft) : '',
+			},
+		};
+	}
+
+	function setAllOptimizationExecutionSelected(selected: boolean): void {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		for (const [key, draft] of Object.entries(optimizationExecutionDrafts)) {
+			nextDrafts[key] = {
+				...draft,
+				selected,
+				error: selected ? validateOptimizationParamDraft(draft) : '',
+			};
+		}
+		optimizationExecutionDrafts = nextDrafts;
+	}
+
 	function updateOptimizationParamField(key: string, field: 'min' | 'max' | 'step', value: string) {
 		const draft = optimizationParamDrafts[key];
 		if (!draft) return;
@@ -2306,6 +2414,22 @@
 		};
 		optimizationParamDrafts = {
 			...optimizationParamDrafts,
+			[key]: {
+				...nextDraft,
+				error: nextDraft.selected ? validateOptimizationParamDraft(nextDraft) : '',
+			},
+		};
+	}
+
+	function updateOptimizationExecutionField(key: string, field: 'min' | 'max' | 'step', value: string): void {
+		const draft = optimizationExecutionDrafts[key];
+		if (!draft) return;
+		const nextDraft = {
+			...draft,
+			[field]: value,
+		};
+		optimizationExecutionDrafts = {
+			...optimizationExecutionDrafts,
 			[key]: {
 				...nextDraft,
 				error: nextDraft.selected ? validateOptimizationParamDraft(nextDraft) : '',
@@ -2342,6 +2466,38 @@
 		return {
 			error: firstError,
 			parameterRanges: Object.keys(parameterRanges).length > 0 ? parameterRanges : undefined,
+		};
+	}
+
+	function collectOptimizationExecutionRanges(): {
+		error: string | null;
+		executionRanges?: Record<string, { min: number; max: number; step: number }>;
+	} {
+		const nextDrafts: Record<string, OptimizationParamDraft> = {};
+		const executionRanges: Record<string, { min: number; max: number; step: number }> = {};
+		let firstError: string | null = null;
+		for (const [key, draft] of Object.entries(optimizationExecutionDrafts)) {
+			let error = '';
+			if (draft.selected) {
+				error = validateOptimizationParamDraft(draft);
+				if (!error) {
+					executionRanges[key] = {
+						min: Number(draft.min),
+						max: Number(draft.max),
+						step: Number(draft.step),
+					};
+				}
+			}
+			if (error && !firstError) firstError = error;
+			nextDrafts[key] = {
+				...draft,
+				error,
+			};
+		}
+		optimizationExecutionDrafts = nextDrafts;
+		return {
+			error: firstError,
+			executionRanges: Object.keys(executionRanges).length > 0 ? executionRanges : undefined,
 		};
 	}
 
@@ -2500,6 +2656,122 @@
 		return null;
 	}
 
+	function getOptimizationHistoryBestParams(item: StrategyContainerHistoryItem): Record<string, unknown> {
+		const metricsParams = asPlainRecord(item.metrics?.best_params);
+		if (Object.keys(metricsParams).length > 0) return metricsParams;
+		const configBest = asPlainRecord(item.config?.best_params);
+		if (Object.keys(configBest).length > 0) return configBest;
+		return extractParamRecord(item.config?.params);
+	}
+
+	function getOptimizationHistoryExecutionProfile(item: StrategyContainerHistoryItem): Record<string, unknown> {
+		const profile = asPlainRecord(item.config?.execution_profile);
+		if (Object.keys(profile).length > 0) return profile;
+		const bestProfile = asPlainRecord(item.config?.best_execution_profile);
+		if (Object.keys(bestProfile).length > 0) return bestProfile;
+		return asPlainRecord(item.config?.best_execution_controls);
+	}
+
+	function optimizationObjectiveLabel(value: unknown): string {
+		const normalized = String(value ?? '').trim();
+		const match = OPTIMIZATION_OBJECTIVES.find((option) => option.value === normalized);
+		return match?.label ?? (normalized || 'Fitness');
+	}
+
+	function optimizationObjectiveValue(item: StrategyContainerHistoryItem): number | null {
+		const objective = String(item.config?.objective || item.metrics?.objective || '').trim();
+		const explicit = readMetricOptional(item, 'best_objective_value', 'objective_value');
+		if (explicit !== null) return explicit;
+		if (objective === 'total_return_pct') return readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct');
+		if (objective === 'profit_factor') return readMetricOptional(item, 'profit_factor', 'pf');
+		if (objective === 'win_rate') return readPercentMetricOptional(item, 'win_rate', 'win_rate_pct');
+		if (objective === 'sharpe_ratio' || objective === 'sharpe') return readMetricOptional(item, 'sharpe_ratio', 'sharpe');
+		return readMetricOptional(item, 'best_fitness', 'fitness');
+	}
+
+	function formatOptimizationObjectiveValue(item: StrategyContainerHistoryItem): string {
+		const value = optimizationObjectiveValue(item);
+		if (value === null || !Number.isFinite(value)) return '--';
+		const objective = String(item.config?.objective || item.metrics?.objective || '').trim();
+		if (objective === 'total_return_pct' || objective === 'win_rate') return `${value.toFixed(2)}%`;
+		return value.toFixed(2);
+	}
+
+	function formatOptimizationChipRecord(record: Record<string, unknown>, limit = 6): string[] {
+		return Object.entries(record)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.slice(0, limit)
+			.map(([key, value]) => `${key}=${formatBacktestParamChipValue(value)}`);
+	}
+
+	function optimizationTopResults(item: StrategyContainerHistoryItem): Array<Record<string, unknown>> {
+		const top = item.config?.top_results;
+		return Array.isArray(top) ? top.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object').slice(0, 3) : [];
+	}
+
+	function optimizationRunMarketLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const symbol = String(config.symbol ?? item.symbol ?? '').trim() || 'Symbol';
+		const timeframe = String(config.timeframe ?? item.timeframe ?? '').trim() || 'TF';
+		return `${symbol} / ${timeframe}`;
+	}
+
+	function optimizationRunWindowLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const start = String(config.start ?? item.start_date ?? '').trim();
+		const end = String(config.end ?? item.end_date ?? '').trim();
+		return `${fmtShortDate(start)} -> ${fmtShortDate(end)}`;
+	}
+
+	function optimizationWfaLabel(item: StrategyContainerHistoryItem): string {
+		const config = asPlainRecord(item.config);
+		const metrics = asPlainRecord(item.metrics);
+		const verdict = String(config.wfa_verdict ?? metrics.wfa_verdict ?? '').trim();
+		if (verdict) return verdict.toUpperCase();
+		const validated = config.validated ?? metrics.validated;
+		if (validated === true) return 'VALIDATED';
+		if (validated === false) return 'NOT VALIDATED';
+		return '--';
+	}
+
+	function optimizationWfaClass(item: StrategyContainerHistoryItem): string {
+		const label = optimizationWfaLabel(item).toLowerCase();
+		if (label.includes('fail') || label.includes('not')) return 'text-red-300';
+		if (label.includes('pass') || label.includes('valid')) return 'text-emerald-300';
+		return 'text-gray-300';
+	}
+
+	function formatOptimizationObjectiveByName(objective: string, value: number | null): string {
+		if (value === null || !Number.isFinite(value)) return '--';
+		if (objective === 'total_return_pct' || objective === 'win_rate') return `${value.toFixed(2)}%`;
+		return value.toFixed(2);
+	}
+
+	function optimizationTopObjectiveLabel(entry: Record<string, unknown>, item: StrategyContainerHistoryItem): string {
+		const objective = String(entry.objective ?? item.config?.objective ?? item.metrics?.objective ?? '').trim();
+		const value = asNumber(entry.objective_value, Number.NaN);
+		const fallback = asNumber(entry.fitness, Number.NaN);
+		const resolved = Number.isFinite(value) ? value : Number.isFinite(fallback) ? fallback : null;
+		return formatOptimizationObjectiveByName(objective, resolved);
+	}
+
+	function optimizationTopFitnessLabel(entry: Record<string, unknown>): string {
+		const fitness = asNumber(entry.fitness, Number.NaN);
+		return Number.isFinite(fitness) ? fitness.toFixed(2) : '--';
+	}
+
+	function optimizationTopParamChips(entry: Record<string, unknown>, limit = 4): string[] {
+		const params = asPlainRecord(entry.full_params);
+		const fallback = asPlainRecord(entry.params);
+		return formatOptimizationChipRecord(Object.keys(params).length > 0 ? params : fallback, limit);
+	}
+
+	function optimizationTopExecutionChips(entry: Record<string, unknown>, limit = 4): string[] {
+		const controls = asPlainRecord(entry.full_execution_controls);
+		const fallback = asPlainRecord(entry.execution_controls);
+		return formatOptimizationChipRecord(Object.keys(controls).length > 0 ? controls : fallback, limit);
+	}
+
 	function getEffectiveOptimizationParams(): Record<string, unknown> | null {
 		if (!selectedResult) return null;
 		const bestParams = getOptBestParams();
@@ -2511,6 +2783,21 @@
 		};
 	}
 
+	function getEffectiveOptimizationExecutionDraft(): ExecutionProfileDraft | null {
+		if (!selectedResult) return null;
+		const config = asPlainRecord(selectedResult.config);
+		const executionProfile = asPlainRecord(config.execution_profile);
+		const bestExecutionProfile = asPlainRecord(config.best_execution_profile);
+		const bestExecutionControls = asPlainRecord(config.best_execution_controls);
+		const source = Object.keys(executionProfile).length > 0
+			? executionProfile
+			: Object.keys(bestExecutionProfile).length > 0
+				? bestExecutionProfile
+				: bestExecutionControls;
+		if (Object.keys(source).length === 0) return null;
+		return buildExecutionDraftFromRecord(source, containerExecutionDefaults);
+	}
+
 	function isOptimizationResult(): boolean {
 		return selectedResult?.result_type === 'optimization' && getOptBestParams() !== null;
 	}
@@ -2519,6 +2806,7 @@
 		if (!container || !selectedResult || backtestingOptParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
 		if (!effectiveParams) return;
+		const optimizedExecutionDraft = getEffectiveOptimizationExecutionDraft();
 		backtestingOptParams = true;
 		try {
 			// Re-run over the SAME window the optimization used (stored on the result
@@ -2538,6 +2826,7 @@
 				params: effectiveParams,
 				definition_json: getResultDefinitionJson(selectedResult),
 				preserve_result: true,
+				...executionDraftToPayload(optimizedExecutionDraft ?? executionDraft),
 			});
 			if (response.status === 'succeeded') {
 				addToast('Gauntlet with optimized params completed', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
@@ -2558,13 +2847,17 @@
 		if (!container || settingDefaultParams) return;
 		const effectiveParams = getEffectiveOptimizationParams();
 		if (!effectiveParams) return;
+		const optimizedExecutionDraft = getEffectiveOptimizationExecutionDraft();
+		const paramsToSave = optimizedExecutionDraft
+			? { ...effectiveParams, execution_profile: executionDraftToPayload(optimizedExecutionDraft) }
+			: effectiveParams;
 		const confirmed = typeof window === 'undefined' || window.confirm(
 			'Set these optimized parameters as the strategy defaults?\n\nThis will update the parameters used for paper trading and live execution.'
 		);
 		if (!confirmed) return;
 		settingDefaultParams = true;
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, effectiveParams, { pinnedBacktestId: null });
+			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			await loadContainer();
 		} catch (err) {
@@ -2907,11 +3200,28 @@
 			addToast(parameterRangeError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			return;
 		}
+		const { error: executionRangeError, executionRanges } = collectOptimizationExecutionRanges();
+		if (executionRangeError) {
+			submitStatus = 'failed';
+			submitMessage = executionRangeError;
+			resetSubmitProgress();
+			addToast(executionRangeError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			return;
+		}
+		const executionValidationError = validateExecutionDraft(executionDraft);
+		if (executionValidationError) {
+			submitStatus = 'failed';
+			submitMessage = executionValidationError;
+			resetSubmitProgress();
+			addToast(executionValidationError, 'error', `/lab/strategy/${encodeURIComponent(strategyId)}`);
+			return;
+		}
 		submitStatus = 'submitting';
 		submitMessage = '';
 		submitJobId = null;
 		resetSubmitProgress();
 		try {
+			const executionPayload = executionDraftToPayload(executionDraft);
 			const response = await submitOptimization({
 				strategy_id: container.strategy.id,
 				strategy_name: container.strategy.name,
@@ -2922,6 +3232,9 @@
 				objective: optimizationForm.objective,
 				n_trials: optimizationForm.n_trials,
 				parameter_ranges: parameterRanges,
+				execution_parameter_ranges: executionRanges,
+				execution_profile: executionPayload,
+				...executionPayload,
 			});
 			submitJobId = response.job_id;
 			if (response.status === 'succeeded') {
@@ -3780,7 +4093,7 @@
 									<div class="mt-1 text-xs text-gray-400">Select numeric params to optimize. Unchecked params stay fixed at the current strategy defaults.</div>
 								</div>
 								<div class="rounded-full border border-cyan-900/40 bg-cyan-950/20 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-cyan-200">
-									{Object.values(optimizationParamDrafts).filter((draft) => draft.selected).length} selected
+									{optimizationParamSelectedCount} selected
 								</div>
 							</div>
 							{#if Object.keys(optimizationParamDrafts).length === 0}
@@ -3788,7 +4101,18 @@
 									No numeric strategy params are available for optimization on this container.
 								</div>
 							{:else}
-								<div class="mt-3 grid gap-2">
+								<label class="mt-3 flex w-fit items-center gap-3 text-xs">
+									<input
+										data-testid="opt-param-select-all"
+										type="checkbox"
+										class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-cyan-400 focus:ring-cyan-500/30"
+										checked={allOptimizationParamsSelected}
+										indeterminate={someOptimizationParamsSelected}
+										on:change={(event) => setAllOptimizationParamsSelected((event.currentTarget as HTMLInputElement).checked)}
+									/>
+									<span class="font-medium uppercase tracking-wide text-gray-300">Select all</span>
+								</label>
+								<div class="mt-2 grid gap-2">
 									{#each Object.values(optimizationParamDrafts) as draft (draft.key)}
 										<div class="rounded-lg border border-[#1d1d1d] bg-[#050505] p-3">
 											<div class="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
@@ -3851,6 +4175,93 @@
 									{/each}
 								</div>
 							{/if}
+							<div class="mt-4 border-t border-[#1a1a1a] pt-4">
+								<div class="flex items-center justify-between gap-2">
+									<div class="text-[10px] uppercase tracking-wide text-gray-500">Execution Settings</div>
+									<div class="rounded-full border border-blue-900/40 bg-blue-950/20 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-blue-200">
+										{optimizationExecutionSelectedCount} selected
+									</div>
+								</div>
+								{#if Object.keys(optimizationExecutionDrafts).length === 0}
+									<div class="mt-3 rounded border border-[#1a1a1a] bg-[#050505] px-3 py-2 text-xs text-gray-500">
+										No numeric execution settings are active for the current sizing mode.
+									</div>
+								{:else}
+									<label class="mt-3 flex w-fit items-center gap-3 text-xs">
+										<input
+											data-testid="opt-exec-select-all"
+											type="checkbox"
+											class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-blue-400 focus:ring-blue-500/30"
+											checked={allOptimizationExecutionSelected}
+											indeterminate={someOptimizationExecutionSelected}
+											on:change={(event) => setAllOptimizationExecutionSelected((event.currentTarget as HTMLInputElement).checked)}
+										/>
+										<span class="font-medium uppercase tracking-wide text-gray-300">Select all execution</span>
+									</label>
+									<div class="mt-2 grid gap-2">
+										{#each Object.values(optimizationExecutionDrafts) as draft (draft.key)}
+											<div class="rounded-lg border border-[#1d1d1d] bg-[#050505] p-3">
+												<div class="grid gap-3 lg:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
+													<label class="flex items-center gap-3 text-sm text-white">
+														<input
+															data-testid={`opt-exec-select-${draft.key}`}
+															type="checkbox"
+															class="h-4 w-4 rounded border border-[#2b2b2b] bg-black text-blue-400 focus:ring-blue-500/30"
+															checked={draft.selected}
+															on:change={(event) => setOptimizationExecutionSelected(draft.key, (event.currentTarget as HTMLInputElement).checked)}
+														/>
+														<span class="font-medium uppercase tracking-wide text-gray-200">{draft.key}</span>
+														<span class="rounded-full border border-[#243240] bg-[#09111a] px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-blue-200">Current {optimizationParamCurrentLabel(draft.current, draft.kind)}</span>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Min</div>
+														<input
+															data-testid={`opt-exec-min-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.min}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'min', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Max</div>
+														<input
+															data-testid={`opt-exec-max-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.max}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'max', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<label class="block">
+														<div class="text-[10px] uppercase tracking-wide text-gray-500">Step</div>
+														<input
+															data-testid={`opt-exec-step-${draft.key}`}
+															type="number"
+															step={draft.kind === 'int' ? '1' : 'any'}
+															class="mt-1 w-full rounded border border-[#2b2b2b] bg-[#090909] px-2 py-1.5 text-sm text-white outline-none focus:border-white/60"
+															value={draft.step}
+															on:input={(event) => updateOptimizationExecutionField(draft.key, 'step', (event.currentTarget as HTMLInputElement).value)}
+														/>
+													</label>
+													<div class="flex items-end">
+														<div class="rounded border border-[#1d1d1d] bg-[#090909] px-3 py-2 text-[11px] text-gray-400">
+															{draft.kind === 'int' ? 'Whole-number sweep' : 'Decimal sweep'}
+														</div>
+													</div>
+												</div>
+												{#if draft.error}
+													<div data-testid={`opt-exec-error-${draft.key}`} class="mt-2 rounded border border-red-900/40 bg-red-950/20 px-2.5 py-2 text-[11px] text-red-200">
+														{draft.error}
+													</div>
+												{/if}
+											</div>
+										{/each}
+									</div>
+								{/if}
+							</div>
 						</div>
 					</div>
 
@@ -3862,15 +4273,21 @@
 							{:else}
 								<div class="mt-3 grid gap-3">
 									{#each optimizationHistory as item}
+										{@const objectiveName = String(item.config?.objective || item.metrics?.objective || '').trim()}
+										{@const bestParamChips = formatOptimizationChipRecord(getOptimizationHistoryBestParams(item), 8)}
+										{@const executionChips = formatOptimizationChipRecord(getOptimizationHistoryExecutionProfile(item), 8)}
+										{@const topResults = optimizationTopResults(item)}
 										<button
 											data-testid={`optimization-row-${item.result_id}`}
 											class={`rounded border border-[#222] bg-[#090909] px-4 py-3 text-left transition ${historyCardBorder(item.result_type)} ${selectedResultId === item.result_id ? 'border-blue-500/70 shadow-[0_0_0_1px_rgba(96,165,250,0.08),0_18px_40px_rgba(59,130,246,0.08)]' : ''}`}
 											on:click={() => void openResult(item)}
 										>
-											<div class="flex items-center gap-2 text-xs">
-												<span class="font-mono text-cyan-300">{item.result_id}</span>
+											<div class="flex flex-wrap items-center gap-2 text-xs">
+												<span class="break-all font-mono text-cyan-300">{item.result_id}</span>
 												<span class={`rounded border px-1 py-0.5 text-[10px] ${resultTypeBadge(item.result_type)}`}>{item.result_type}</span>
 												<span class={`rounded border px-1.5 py-0.5 text-[10px] ${statusBadgeClass(historyItemStatus(item))}`}>{statusLabel(historyItemStatus(item))}</span>
+												<span class="rounded border border-[#252525] bg-black px-2 py-0.5 font-mono text-[10px] text-gray-300">{optimizationRunMarketLabel(item)}</span>
+												<span class="rounded border border-[#252525] bg-black px-2 py-0.5 font-mono text-[10px] text-gray-400">{optimizationRunWindowLabel(item)}</span>
 												<span class="ml-auto text-gray-500">{fmtDate(item.created_at)}</span>
 											</div>
 											{#if historyItemError(item)}
@@ -3878,24 +4295,87 @@
 													{historyItemError(item)}
 												</div>
 											{/if}
-											<div class="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+											<div class="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-3 xl:grid-cols-6">
+												<div class="border-l border-blue-900/60 bg-black/50 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">{optimizationObjectiveLabel(objectiveName)}</div>
+													<div class="mt-1 font-mono text-sm text-blue-200">{formatOptimizationObjectiveValue(item)}</div>
+												</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Fitness</div>
 													<div class="mt-1 font-mono text-sm text-gray-300">{numOrDash(readMetricOptional(item, 'best_fitness', 'fitness'))}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Sharpe</div>
 													<div class={`mt-1 font-mono text-sm ${isSharpeReliable(item) ? 'text-gray-300' : 'text-gray-500'}`} title={isSharpeReliable(item) ? undefined : 'Low trade count (<20) — Sharpe may be noisy'}>{formatSharpe(item)}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
-													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">OOS Return</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Return</div>
 													<div class={`mt-1 font-mono text-sm ${signedPercentClass(readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct'))}`}>{pctOrDash(readPercentMetricOptional(item, 'total_return_pct', 'total_return', 'pnl_pct'))}</div>
 												</div>
-												<div class="rounded border border-[#1f1f1f] bg-black px-3 py-2">
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">WFA</div>
+													<div class={`mt-1 font-mono text-sm ${optimizationWfaClass(item)}`}>{optimizationWfaLabel(item)}</div>
+												</div>
+												<div class="border-l border-[#252525] bg-black/40 px-3 py-2">
 													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Trials</div>
 													<div class="mt-1 font-mono text-sm text-gray-300">{historyItemTrials(item) ?? '--'}</div>
 												</div>
 											</div>
+											<div class="mt-3 grid gap-3 border-t border-[#1a1a1a] pt-3 lg:grid-cols-2">
+												<div>
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Best Params</div>
+													{#if bestParamChips.length}
+														<div class="mt-2 flex flex-wrap gap-1.5">
+															{#each bestParamChips as chip}
+																<span class="rounded border border-blue-900/50 bg-blue-950/10 px-2 py-1 font-mono text-[10px] text-blue-100">{chip}</span>
+															{/each}
+														</div>
+													{:else}
+														<div class="mt-2 text-[11px] text-gray-600">No optimized signal parameters stored.</div>
+													{/if}
+												</div>
+												<div>
+													<div class="text-[10px] uppercase tracking-[0.18em] text-gray-500">Execution Profile</div>
+													{#if executionChips.length}
+														<div class="mt-2 flex flex-wrap gap-1.5">
+															{#each executionChips as chip}
+																<span class="rounded border border-emerald-900/50 bg-emerald-950/10 px-2 py-1 font-mono text-[10px] text-emerald-100">{chip}</span>
+															{/each}
+														</div>
+													{:else}
+														<div class="mt-2 text-[11px] text-gray-600">No execution overrides stored.</div>
+													{/if}
+												</div>
+											</div>
+											{#if topResults.length}
+												<div class="mt-3 border-t border-[#1a1a1a] pt-3">
+													<div class="mb-2 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-gray-500">
+														<span>Top Candidates</span>
+														<span class="font-mono text-gray-700">{topResults.length}</span>
+													</div>
+													<div class="grid gap-2 xl:grid-cols-3">
+														{#each topResults as candidate, index}
+															{@const candidateParams = optimizationTopParamChips(candidate, 4)}
+															{@const candidateExecution = optimizationTopExecutionChips(candidate, 4)}
+															<div class="border border-[#1f1f1f] bg-black/40 px-3 py-2">
+																<div class="flex items-center gap-2 text-[11px]">
+																	<span class="font-mono text-gray-500">#{index + 1}</span>
+																	<span class="font-mono text-blue-200">{optimizationTopObjectiveLabel(candidate, item)}</span>
+																	<span class="ml-auto font-mono text-gray-500">fit {optimizationTopFitnessLabel(candidate)}</span>
+																</div>
+																<div class="mt-2 flex flex-wrap gap-1">
+																	{#each candidateParams as chip}
+																		<span class="rounded border border-[#282828] px-1.5 py-0.5 font-mono text-[9px] text-gray-300">{chip}</span>
+																	{/each}
+																	{#each candidateExecution as chip}
+																		<span class="rounded border border-emerald-900/40 px-1.5 py-0.5 font-mono text-[9px] text-emerald-200">{chip}</span>
+																	{/each}
+																</div>
+															</div>
+														{/each}
+													</div>
+												</div>
+											{/if}
 										</button>
 									{/each}
 								</div>
