@@ -584,6 +584,82 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.textContent).toContain('BTC-MACD-S0001');
 	});
 
+	// Two runs with DISTINCT symbol/timeframe/window: B1001 (BTC/1h, drives the form on
+	// load) and B2002 (ETH/4h, a different span). Shared by the sync + reset tests.
+	function buildTwoRunContainer(): Record<string, unknown> {
+		const container = buildContainer(['B1001']);
+		(container.history as Record<string, unknown>).backtests = [
+			buildHistoryItem('B1001', {
+				symbol: 'BTC/USDT',
+				timeframe: '1h',
+				start_date: '2025-03-11T00:00:00Z',
+				end_date: '2026-03-11T00:00:00Z',
+				config: { start: '2025-03-11T00:00:00Z', end: '2026-03-11T00:00:00Z', params: { fast: 12, slow: 26, signal: 9 } },
+			}),
+			buildHistoryItem('B2002', {
+				symbol: 'ETH/USDT',
+				timeframe: '4h',
+				start_date: '2024-01-15T00:00:00Z',
+				end_date: '2024-07-15T00:00:00Z',
+				config: { start: '2024-01-15T00:00:00Z', end: '2024-07-15T00:00:00Z', params: { fast: 8, slow: 21, signal: 5 } },
+			}),
+		];
+		return container;
+	}
+
+	it('syncs the backtest symbol, timeframe and window to the run when a gauntlet history row is clicked', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildTwoRunContainer());
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const symbolInput = () => target.querySelector('#container-backtest-symbol') as HTMLInputElement | null;
+		const timeframeInput = () => target.querySelector('#container-backtest-timeframe') as HTMLSelectElement | null;
+		const startInput = () => target.querySelector('#container-backtest-start') as HTMLInputElement | null;
+		const endInput = () => target.querySelector('#container-backtest-end') as HTMLInputElement | null;
+		// On load the form takes the container default (FIRST run's) context.
+		expect(symbolInput()?.value).toBe('BTC/USDT');
+		expect(timeframeInput()?.value).toBe('1h');
+		expect(startInput()?.value).toBe('2025-03-11');
+		expect(endInput()?.value).toBe('2026-03-11');
+
+		// Clicking the second row re-points symbol/timeframe/window at THAT run.
+		clickByTestId(target, 'backtest-row-B2002');
+		await waitForCondition(() => startInput()?.value === '2024-01-15');
+		expect(symbolInput()?.value).toBe('ETH/USDT');
+		expect(timeframeInput()?.value).toBe('4h');
+		expect(startInput()?.value).toBe('2024-01-15');
+		expect(endInput()?.value).toBe('2024-07-15');
+	});
+
+	it('restores the container default symbol/timeframe/window when Reset to Defaults is clicked after selecting a run', async () => {
+		apiMocks.getStrategyContainer.mockResolvedValue(buildTwoRunContainer());
+		apiMocks.getResult.mockImplementation(async (resultId: string) => buildResult(resultId));
+		apiMocks.getResultChartContext.mockImplementation(async (resultId: string) => buildChartContext(resultId));
+
+		app = mount(StrategyDetailPage, { target });
+		await openBacktestHistory(target);
+
+		const symbolInput = () => target.querySelector('#container-backtest-symbol') as HTMLInputElement | null;
+		const timeframeInput = () => target.querySelector('#container-backtest-timeframe') as HTMLSelectElement | null;
+		const startInput = () => target.querySelector('#container-backtest-start') as HTMLInputElement | null;
+		const endInput = () => target.querySelector('#container-backtest-end') as HTMLInputElement | null;
+
+		// Move the full context to the second run, then Reset to Defaults must restore the
+		// container default (first run) symbol/timeframe/window — not leave it on the run.
+		clickByTestId(target, 'backtest-row-B2002');
+		await waitForCondition(() => startInput()?.value === '2024-01-15');
+
+		clickByTestId(target, 'backtest-params-reset');
+		await waitForCondition(() => startInput()?.value === '2025-03-11');
+		expect(symbolInput()?.value).toBe('BTC/USDT');
+		expect(timeframeInput()?.value).toBe('1h');
+		expect(startInput()?.value).toBe('2025-03-11');
+		expect(endInput()?.value).toBe('2026-03-11');
+	});
+
 	it('opens TradingView Pine in a copyable script panel', async () => {
 		const writeText = vi.fn().mockResolvedValue(undefined);
 		Object.defineProperty(navigator, 'clipboard', {
@@ -976,6 +1052,31 @@ describe('/lab/strategy/[id] backtest history', () => {
 		expect(target.querySelector('[data-testid="backtest-param-summary-B1001"]')?.textContent).not.toContain('gamma=3');
 	});
 
+	it('does not show the params draft as permanently dirty when the strategy has a saved execution_profile', async () => {
+		// Regression: execution_profile is persisted INSIDE params but must be
+		// stripped from the alpha-param draft on BOTH sides (strategyParams and
+		// paramsDraft). Otherwise a freshly-loaded strategy reads as permanently
+		// "Unsaved"/"Draft has changes" (the Save button never disables).
+		const container = buildContainer([], {
+			params: { fast: 12, slow: 26, signal: 9, execution_profile: { sizing_mode: 'fraction', risk_per_trade: 0.02, stop_loss_pct: 2 } },
+		});
+		apiMocks.getStrategyContainer.mockResolvedValue(container);
+
+		app = mount(StrategyDetailPage, { target });
+		// Open the Gauntlet section (no history rows needed) and reach the params pane
+		// on its DEFAULT view — the exact state the user reported as stuck "Unsaved".
+		await waitForCondition(() =>
+			Array.from(target.querySelectorAll('button')).some((b) => (b.textContent ?? '').includes('Gauntlet History')),
+		);
+		clickButtonByText(target, 'Gauntlet History');
+		await waitForCondition(() => target.querySelector('[data-testid="backtest-params-save"]') !== null);
+
+		const save = target.querySelector('[data-testid="backtest-params-save"]') as HTMLButtonElement | null;
+		expect(save).not.toBeNull();
+		expect(save?.disabled).toBe(true); // a freshly-loaded saved profile is NOT dirty -> Save disabled
+		expect(target.textContent).not.toContain('Draft has changes');
+	});
+
 	it('loads gauntlet execution settings from a selected history row and resets to defaults', async () => {
 		const container = buildContainer([], {
 			params: { fast: 12, slow: 26, signal: 9, leverage: 1 },
@@ -1155,11 +1256,14 @@ describe('/lab/strategy/[id] backtest history', () => {
 			clickButtonByText(target, 'Save');
 			await waitForCondition(() => backtestingMocks.updateStrategyDefaultParams.mock.calls.length > 0);
 
-			expect(backtestingMocks.updateStrategyDefaultParams).toHaveBeenCalledWith('S0001', {
+			// Save now also persists the execution profile under params.execution_profile
+			// (the canonical home the optimizer/gauntlet read), alongside the alpha params.
+			expect(backtestingMocks.updateStrategyDefaultParams).toHaveBeenCalledWith('S0001', expect.objectContaining({
 				fast: 12,
 				custom_note: 'keep this draft note',
 				threshold: 0.75,
-			}, { pinnedBacktestId: null });
+				execution_profile: expect.any(Object),
+			}), { pinnedBacktestId: null });
 		});
 
 		it('disables Add Param controls when the draft already contains every supported param', async () => {

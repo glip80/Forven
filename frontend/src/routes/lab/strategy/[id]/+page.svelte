@@ -209,6 +209,17 @@
 		end_date: defaultOneYearRange.endDate,
 	};
 
+	// The container's default backtest context (symbol/timeframe from the configuration +
+	// the first/pinned run's window, captured at load). Clicking a history row overrides
+	// backtestForm; "Reset to Defaults" must restore THIS, not whatever the last-clicked
+	// run happened to use.
+	let containerBacktestDefaults = {
+		symbol: '',
+		timeframe: '1h',
+		start_date: defaultOneYearRange.startDate,
+		end_date: defaultOneYearRange.endDate,
+	};
+
 	let optimizationForm = {
 		symbol: '',
 		timeframe: '1h',
@@ -271,9 +282,21 @@
 	});
 	$: executionTrades = container?.execution.trades ?? [];
 	$: executionPositions = container?.execution.positions ?? [];
-	$: strategyParams = (container?.configuration.params && typeof container.configuration.params === 'object' && !Array.isArray(container.configuration.params))
-		? container.configuration.params as Record<string, unknown>
-		: {};
+	// execution_profile is persisted INSIDE params (the canonical home the
+	// optimizer/gauntlet read) but is NOT an alpha param. Strip it everywhere the
+	// alpha-param draft is built so (a) it never shows in the ParameterEditor and
+	// (b) the strategyParams<->paramsDraft dirty comparison stays symmetric — both
+	// sides must omit it, or the draft reads as permanently "Unsaved".
+	function stripExecutionProfile(value: unknown): Record<string, unknown> {
+		if (!(value && typeof value === 'object' && !Array.isArray(value))) return {};
+		const out: Record<string, unknown> = {};
+		for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+			if (key !== 'execution_profile') out[key] = entry;
+		}
+		return out;
+	}
+
+	$: strategyParams = stripExecutionProfile(container?.configuration.params);
 	$: recentEvents = container?.events ?? [];
 	$: submitProgressPct = parseProgressPct(submitProgress);
 	$: datasetSuggestionSymbols = buildDatasetSymbolSuggestions(availableDatasets, backtestForm.timeframe || optimizationForm.timeframe || '1h');
@@ -352,7 +375,7 @@
 	$: selectedChartWarnings = selectedChartContext?.warnings ?? [];
 	$: selectedChartStart = selectedChartBars.length > 0 ? selectedChartBars[0]?.timestamp ?? null : null;
 	$: selectedChartEnd = selectedChartBars.length > 0 ? selectedChartBars[selectedChartBars.length - 1]?.timestamp ?? null : null;
-	$: containerExecutionDefaults = buildContainerExecutionDefaults();
+	$: containerExecutionDefaults = buildContainerExecutionDefaults(container, pipelineSettings);
 	$: executionDirty = !areExecutionDraftsEqual(containerExecutionDefaults, executionDraft);
 	$: executionDraftError = validateExecutionDraft(executionDraft) ?? '';
 	$: paramsDirty = !areParameterRecordsEqual(strategyParams, paramsDraft);
@@ -920,11 +943,21 @@
 		};
 	}
 
-	function buildContainerExecutionDefaults(): ExecutionProfileDraft {
+	// `containerArg`/`settingsArg` are passed explicitly from the reactive block so
+	// Svelte tracks `container` and `pipelineSettings` as dependencies. A bare
+	// `buildContainerExecutionDefaults()` call in a `$:` statement names no reactive
+	// identifiers, so the compiler computes it ONCE at init (container still null) and
+	// never recomputes — which froze `containerExecutionDefaults` at fallback defaults
+	// and left `executionDirty` permanently true on every strategy. Imperative callers
+	// (loadContainer) rely on the defaults to read the live module-level values.
+	function buildContainerExecutionDefaults(
+		containerArg: typeof container = container,
+		settingsArg: typeof pipelineSettings = pipelineSettings,
+	): ExecutionProfileDraft {
 		const fallback = buildFallbackExecutionDraft();
-		const configuration = asPlainRecord(container?.configuration);
+		const configuration = asPlainRecord(containerArg?.configuration);
 		const params = extractParamRecord(configuration.params);
-		const settings = asPlainRecord(pipelineSettings);
+		const settings = asPlainRecord(settingsArg);
 		return buildExecutionDraftFromRecord(
 			{
 				initial_capital: configuration.initial_capital ?? params.initial_capital,
@@ -941,7 +974,7 @@
 				take_profit_pct: configuration.take_profit_pct ?? params.take_profit_pct,
 				trailing_stop_pct: configuration.trailing_stop_pct ?? params.trailing_stop_pct,
 				time_stop_bars: configuration.time_stop_bars ?? params.time_stop_bars,
-				execution_profile: configuration.execution_profile,
+				execution_profile: configuration.execution_profile ?? params.execution_profile,
 			},
 			fallback,
 		);
@@ -2566,6 +2599,10 @@
 	function resetParameterDraft(): void {
 		paramsDraft = cloneParameterRecord(strategyParams);
 		executionDraft = { ...containerExecutionDefaults };
+		// A row click can move the backtest symbol/timeframe/window away from the container
+		// default; a "Reset to Defaults" that left them pointed at the last-clicked run
+		// would be a half-reset. Restore the captured default context alongside the draft.
+		backtestForm = { ...backtestForm, ...containerBacktestDefaults };
 		gauntletDraftSource = 'defaults';
 		gauntletDraftSourceId = '';
 		parameterSaveMessage = '';
@@ -2579,6 +2616,22 @@
 	function loadGauntletDraftFromHistory(item: StrategyContainerHistoryItem, notify = false): void {
 		paramsDraft = getBacktestParamDraft(item);
 		executionDraft = getHistoryExecutionDraft(item);
+		// Mirror the selected run's full backtest context into the form — symbol,
+		// timeframe AND the date span — so the loaded draft reflects the SAME inputs it
+		// was produced over and re-running ("Run the Gauntlet") reproduces the run instead
+		// of pairing a stale symbol/timeframe with a new window. Symbol/timeframe fall back
+		// to the current form when the run omits them; the date span is applied only when
+		// BOTH endpoints parse (atomic) so we never blend a new start with a stale end.
+		const windowStart = toDateInput(item.start_date ?? item.config.start);
+		const windowEnd = toDateInput(item.end_date ?? item.config.end);
+		const runSymbol = (item.symbol ?? '').trim();
+		const runTimeframe = (item.timeframe ?? '').trim();
+		backtestForm = {
+			...backtestForm,
+			symbol: runSymbol || backtestForm.symbol,
+			timeframe: runTimeframe || backtestForm.timeframe,
+			...(windowStart && windowEnd ? { start_date: windowStart, end_date: windowEnd } : {}),
+		};
 		gauntletDraftSource = 'run';
 		gauntletDraftSourceId = String(item.result_id || '').trim();
 		parameterSaveMessage = '';
@@ -2593,8 +2646,8 @@
 	}
 
 	async function saveParameterDraft(): Promise<void> {
-		if (!container || settingDefaultParams || !paramsDirty) return;
-		if (paramsHasErrors) {
+		if (!container || settingDefaultParams || !gauntletDraftDirty) return;
+		if (paramsHasErrors || executionDraftError) {
 			addToast('Fix the highlighted parameter errors before saving.', 'error');
 			return;
 		}
@@ -2602,7 +2655,12 @@
 		parameterSaveMessage = '';
 		parameterSaveError = '';
 		try {
-			await updateStrategyDefaultParams(container.strategy.id, paramsDraft, { pinnedBacktestId: null });
+			// Persist the execution profile under params.execution_profile — the
+			// canonical home the optimizer / gauntlet / acceptance gate read — alongside
+			// the alpha params, so a tuned profile survives reload and drives backtests
+			// instead of being ephemeral.
+			const paramsToSave = { ...paramsDraft, execution_profile: executionDraftToPayload(executionDraft) };
+			await updateStrategyDefaultParams(container.strategy.id, paramsToSave, { pinnedBacktestId: null });
 			parameterSaveMessage = 'Default parameters saved.';
 			addToast('Default parameters updated', 'success', `/lab/strategy/${encodeURIComponent(strategyId)}`);
 			await loadContainer();
@@ -2655,6 +2713,7 @@
 				start_date: resolvedStartDate,
 				end_date: resolvedEndDate,
 			};
+			containerBacktestDefaults = { ...backtestForm };
 			optimizationForm = {
 				...optimizationForm,
 				symbol: defaultSymbol,
@@ -2662,11 +2721,7 @@
 				start_date: resolvedStartDate,
 				end_date: resolvedEndDate,
 			};
-			paramsDraft = cloneParameterRecord(
-				(payload.configuration.params && typeof payload.configuration.params === 'object' && !Array.isArray(payload.configuration.params))
-					? (payload.configuration.params as Record<string, unknown>)
-					: {},
-			);
+			paramsDraft = cloneParameterRecord(stripExecutionProfile(payload.configuration.params));
 			executionDraft = buildContainerExecutionDefaults();
 			gauntletDraftSource = 'defaults';
 			gauntletDraftSourceId = '';
@@ -3107,13 +3162,13 @@
 									type="button"
 									class="rounded border border-[#2b2b2b] bg-black px-2 py-1 text-[10px] uppercase tracking-wide text-gray-400 transition hover:text-white disabled:opacity-40"
 									on:click={resetParameterDraft}
-									disabled={!paramsDirty || settingDefaultParams}
+									disabled={!gauntletDraftDirty || settingDefaultParams}
 								>Reset</button>
 								<button
 									type="button"
 									class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-1 text-[10px] uppercase tracking-wide text-emerald-200 transition hover:bg-emerald-900/40 disabled:opacity-40"
 									on:click={saveParameterDraft}
-									disabled={!paramsDirty || settingDefaultParams || paramsHasErrors}
+									disabled={!gauntletDraftDirty || settingDefaultParams || paramsHasErrors || Boolean(executionDraftError)}
 								>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
 							</div>
 						</div>
@@ -3342,7 +3397,7 @@
 						</div>
 						<div class="flex items-center gap-1.5">
 							<button type="button" class="rounded border border-[#2b2b2b] bg-black px-2 py-0.5 text-[10px] uppercase text-gray-400 hover:text-white disabled:opacity-40" data-testid="backtest-params-reset" on:click|stopPropagation={resetGauntletDraftToDefaults} disabled={(gauntletDraftSource === 'defaults' && !gauntletDraftDirty) || settingDefaultParams}>Reset to Defaults</button>
-							<button type="button" class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-0.5 text-[10px] uppercase text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-40" data-testid="backtest-params-save" on:click|stopPropagation={saveParameterDraft} disabled={!paramsDirty || settingDefaultParams || paramsHasErrors}>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
+							<button type="button" class="rounded border border-emerald-700 bg-emerald-950/30 px-2 py-0.5 text-[10px] uppercase text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-40" data-testid="backtest-params-save" on:click|stopPropagation={saveParameterDraft} disabled={!gauntletDraftDirty || settingDefaultParams || paramsHasErrors || Boolean(executionDraftError)}>{settingDefaultParams ? 'Saving…' : 'Save'}</button>
 						</div>
 					</summary>
 					<div class="border-t border-[#1a1a1a] p-3" data-testid="backtest-parameter-editor">
