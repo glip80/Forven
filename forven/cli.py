@@ -723,42 +723,6 @@ def scanner_walkforward(bars, splits, strategy):
     console.print(table)
 
 
-# --- Runtime worker (off-API process: scheduler + headless loops + daemon) ---
-
-@cli.group()
-def runtime():
-    """Background runtime worker (scheduler, headless agent/brain, data daemon)."""
-
-
-@runtime.command("start")
-@click.option("--start-delay", type=float, default=0.0,
-              help="Seconds to wait before spawning the loops (lets the API settle first).")
-def runtime_start(start_delay: float):
-    """Run the background loops in a DEDICATED process, off the API request
-    worker, so heavy pandas/parquet/DB work can't starve the HTTP/WebSocket
-    loop. Holds the singleton runtime-worker lock — the API, finding it held,
-    serves requests only. Foreground; exits 2 if the lock is already held."""
-    import logging
-    from pathlib import Path as _Path
-
-    from forven.config import FORVEN_HOME
-
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    try:
-        from forven.logging_config import setup_rotating_file_logger
-
-        setup_rotating_file_logger(
-            _Path(FORVEN_HOME) / "logs" / "runtime_worker.log",
-            level=logging.INFO, fmt=fmt, also_stdout=True,
-        )
-    except Exception:
-        logging.basicConfig(level=logging.INFO, format=fmt)
-
-    from forven.runtime_worker import run_runtime_worker
-
-    raise SystemExit(run_runtime_worker(start_delay_seconds=start_delay))
-
-
 # --- Daemon commands ---
 
 @cli.group()

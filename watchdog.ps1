@@ -311,12 +311,6 @@ if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
 if ([string]::IsNullOrWhiteSpace($env:FORVEN_HOME)) {
     $env:FORVEN_HOME = Join-Path $env:USERPROFILE ".forven"
 }
-# Heavy background loops (scheduler, headless agent/brain, data daemon) run in a
-# dedicated `forven runtime` process (supervised below), so the API must serve
-# HTTP/WebSocket only — never spawn those loops in-process and contend for CPU.
-# The runtime-worker file lock is the real mutual-exclusion guarantee; this flag
-# just stops the API from even trying to acquire it.
-$env:FORVEN_API_RUN_RUNTIME_WORKER = "0"
 
 $logRoot = Join-Path (Join-Path $RepoRoot ".tmp") "logs"
 $restarted = @()
@@ -340,24 +334,6 @@ try {
         exit 1
     }
     $watchdogOwnerLockHeld = $true
-
-    # --- Check Runtime Worker (owns the background loops; the API defers to it) ---
-    $runtimeAlive = $false
-    try {
-        $rtProcs = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match "forven\s+runtime\s+start" -or $_.CommandLine -match "runtime_worker" }
-        if ($rtProcs) { $runtimeAlive = $true }
-    } catch {}
-    if (-not $runtimeAlive) {
-        $rtLog = Join-Path $logRoot "forven_runtime_worker.log"
-        $rtErr = Join-Path $logRoot "forven_runtime_worker.err.log"
-        $proc = Start-Process -FilePath $python -ArgumentList @("-m","forven","runtime","start") `
-            -WorkingDirectory $RepoRoot -RedirectStandardOutput $rtLog -RedirectStandardError $rtErr `
-            -WindowStyle Hidden -PassThru
-        Write-Log ("Runtime worker started as PID " + $proc.Id)
-        $restarted += "runtime_worker"
-        Start-Sleep -Seconds 3
-    }
 
     # --- Check Backend ---
     [array]$backendListeners = @(Get-ListeningPids -Port $BackendPort)

@@ -396,12 +396,7 @@ async def lifespan(_app: FastAPI):
     # Discord bot runtime is unavailable. A file lock ensures only one API
     # process owns these loops.
     try:
-        if not _env_bool("FORVEN_API_RUN_RUNTIME_WORKER", True):
-            log.info(
-                "API runtime worker disabled (FORVEN_API_RUN_RUNTIME_WORKER=0); serving "
-                "HTTP/WebSocket only — a dedicated `forven runtime start` owns the loops"
-            )
-        elif acquire_runtime_worker_lock():
+        if acquire_runtime_worker_lock():
             _api_runtime_lock_held = True
             from forven.scheduler import reset_scheduler_job_locks, run_scheduler_loop
 

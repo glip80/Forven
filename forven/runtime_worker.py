@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import re
-import signal
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -1110,154 +1109,6 @@ def release_runtime_worker_lock() -> None:
     _runtime_worker_lock_fd = None
 
 
-async def _supervise_runtime_loop(name: str, factory, *, restart_seconds: float = 5.0) -> None:
-    """Restart a critical background loop if it exits unexpectedly. A factory may
-    decline to run for a stable, expected reason (e.g. the daemon singleton lock
-    is held elsewhere) by returning an object whose ``stop_supervision`` attribute
-    is truthy — that is NOT a crash, so the supervisor stops instead of hot-
-    restarting. Mirrors the API's _supervise_background_loop."""
-    while True:
-        try:
-            result = await factory()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("%s crashed; restarting in %.1fs", name, restart_seconds)
-        else:
-            if getattr(result, "stop_supervision", False):
-                log.info("%s declined to start (%s); not supervising", name, result)
-                return
-            log.warning("%s exited; restarting in %.1fs", name, restart_seconds)
-        await asyncio.sleep(max(1.0, float(restart_seconds)))
-
-
-async def _run_runtime_worker_async(*, start_delay_seconds: float = 0.0) -> int:
-    """Acquire the singleton lock and run the background loops until stopped."""
-    from forven.scheduler import reset_scheduler_job_locks, run_scheduler_loop
-
-    # Singleton: only ONE process may own the background loops. If the API (or
-    # another worker) still holds the lock, refuse rather than double-run jobs.
-    if not acquire_runtime_worker_lock():
-        log.error(
-            "runtime worker: another process already holds %s — refusing to start "
-            "a second loop owner (would risk double trade execution).",
-            FORVEN_HOME / "api_runtime_worker.lock",
-        )
-        return 2
-
-    # Ensure schema/jobs exist before the loops touch them, and clear any job
-    # locks inherited from a process that died mid-run.
-    try:
-        from forven.db import init_db
-
-        init_db()
-    except Exception:
-        log.exception("runtime worker: init_db failed (continuing)")
-
-    # Arm fail-closed spend enforcement IN THIS PROCESS before any loop can issue
-    # an LLM call. The agent/brain/daemon loops started below spend on the
-    # configured providers; without arming, the model-selection allow-list is a
-    # silent no-op (assert_callable / resolve_route fail OPEN) until the API
-    # process arms the persisted `forven:model-selection-enforced` flag — and the
-    # watchdog starts this worker BEFORE the API, so on a fresh install (or after
-    # disable_enforcement) the loops could spend on never-connected providers.
-    # Mirrors forven/daemon.py and every other spend-capable process; idempotent.
-    try:
-        from forven.model_selection import ensure_enforcement_armed
-
-        ensure_enforcement_armed()
-    except Exception:
-        log.exception("runtime worker: failed to arm spend enforcement")
-    try:
-        recovered = reset_scheduler_job_locks()
-        if recovered:
-            log.info("runtime worker cleared %d inherited scheduler job lock(s)", recovered)
-    except Exception:
-        log.exception("runtime worker: reset_scheduler_job_locks failed")
-
-    def _env_int(name: str, default: int) -> int:
-        try:
-            return int(os.environ.get(name, str(default)) or default)
-        except (TypeError, ValueError):
-            return default
-
-    agent_concurrency = _env_int("FORVEN_HEADLESS_AGENT_CONCURRENCY", 3)
-    brain_limit = _env_int("FORVEN_HEADLESS_BRAIN_LIMIT", 2)
-
-    if start_delay_seconds > 0:
-        await asyncio.sleep(start_delay_seconds)
-
-    factories: list[tuple[str, object]] = [
-        ("scheduler-loop", lambda: run_scheduler_loop(interval_seconds=30)),
-        ("headless-agent-loop", lambda: run_headless_agent_loop(poll_seconds=5.0, concurrency=agent_concurrency)),
-        ("headless-brain-loop", lambda: run_headless_brain_loop(poll_seconds=20.0, limit=brain_limit)),
-    ]
-    # The data/risk daemon holds its OWN singleton lock, so it self-declines if an
-    # external `forven daemon start` is already running — safe to supervise here.
-    try:
-        from forven.daemon import run_in_loop as run_daemon_in_loop
-
-        factories.append(("daemon-loop", run_daemon_in_loop))
-    except Exception:
-        log.exception("runtime worker: daemon loop unavailable")
-
-    tasks = [
-        asyncio.create_task(_supervise_runtime_loop(name, factory), name=name)
-        for name, factory in factories
-    ]
-    log.info(
-        "runtime worker started (pid=%d): scheduler + headless agent (concurrency=%d) "
-        "+ headless brain (limit=%d) + data/risk daemon",
-        os.getpid(), agent_concurrency, brain_limit,
-    )
-
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def _request_stop() -> None:
-        loop.call_soon_threadsafe(stop.set)
-
-    for signame in ("SIGINT", "SIGTERM"):
-        sig = getattr(signal, signame, None)
-        if sig is None:
-            continue
-        try:
-            loop.add_signal_handler(sig, _request_stop)  # POSIX
-        except (NotImplementedError, RuntimeError, ValueError):
-            with suppress(Exception):  # Windows: best-effort; a force-kill releases the OS lock anyway
-                signal.signal(sig, lambda *_a: _request_stop())
-
-    try:
-        await stop.wait()
-    finally:
-        log.info("runtime worker: shutting down loops")
-        try:
-            from forven.daemon import shutdown as daemon_shutdown
-
-            daemon_shutdown.set()
-        except Exception:
-            pass
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        release_runtime_worker_lock()
-    return 0
-
-
-def run_runtime_worker(*, start_delay_seconds: float = 0.0) -> int:
-    """Standalone entry point (``forven runtime start``): run the scheduler +
-    headless agent/brain + data/risk daemon loops in a DEDICATED process, off the
-    API request worker, so heavy pandas/parquet/DB work can never starve the
-    HTTP/WebSocket event loop. Holds the same singleton runtime-worker lock the
-    API uses as a fallback, so exactly one process ever owns these loops (the API,
-    finding the lock held, serves requests only). Foreground; returns an exit code
-    (0 = clean stop, 2 = lock already held)."""
-    try:
-        return asyncio.run(_run_runtime_worker_async(start_delay_seconds=start_delay_seconds))
-    except KeyboardInterrupt:
-        return 0
-
-
 async def process_agent_tasks_once(concurrency: int = 5) -> int:
     """Claim and execute one round of pending agent tasks."""
     from forven.db import claim_pending_agent_tasks, get_db
@@ -1880,6 +1731,5 @@ __all__ = [
     "release_runtime_worker_lock",
     "run_headless_agent_loop",
     "run_headless_brain_loop",
-    "run_runtime_worker",
     "stop_background_task",
 ]
