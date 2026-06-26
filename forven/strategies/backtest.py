@@ -6281,6 +6281,7 @@ def _apply_funding_to_trades(
 
 
 from forven.strategies import sizing as _sizing
+from forven.strategies import execution_kernel as _kernel
 
 
 def _clamp01(value: float) -> float:
@@ -6382,12 +6383,19 @@ def _run_directional_signal_series(
     round_trip_drag = 2.0 * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0)) / 10000.0 * max(float(leverage), 0.0)
 
     ec = _normalize_execution_controls(execution_controls)
-    if ec is not None:
-        return _run_directional_signal_series_with_controls(
-            df, signals, warmup, leverage, regimes=regimes,
-            round_trip_drag=round_trip_drag, trade_mode=trade_mode,
-            allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
-        )
+    if ec is None:
+        # Parity overhaul (decision: unify + re-score): a strategy with NO execution
+        # profile is sized at the default 1% risk (fraction mode) via the SAME shared
+        # kernel the live/paper scanner uses — NOT the legacy full-notional path below.
+        # This is what makes paper reproduce the backtest for profile-less strategies
+        # (the common case for the autonomous pipeline). The legacy loop beneath is now
+        # dead code, retained temporarily and removed in cleanup.
+        ec = _sizing.default_controls()
+    return _run_controls_via_kernel(
+        df, signals, warmup, leverage, regimes=regimes,
+        round_trip_drag=round_trip_drag, trade_mode=trade_mode,
+        allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
+    )
 
     # Signals are derived from a bar's own close, which is only known once that
     # bar has finished. Acting on signal[idx] therefore requires filling at the
@@ -6646,6 +6654,123 @@ def _run_directional_signal_series_with_controls(
         _finalize(at, direction, final_close, final_idx, final_time, "signal", open_at_end=True)
 
     return trades
+
+
+def _run_controls_via_kernel(
+    df: "pd.DataFrame",
+    signals: "DirectionalSignals",
+    warmup: int,
+    leverage: float,
+    *,
+    regimes: "pd.Series | None",
+    round_trip_drag: float,
+    trade_mode: str,
+    allowed_modes: tuple[str, ...],
+    ec: dict,
+    initial_capital: float,
+) -> list[dict]:
+    """Backtest execution via the shared kernel: run :func:`execution_kernel.simulate`
+    over the full history, then force-close any still-open position at the final close
+    (the backtest's accounting convention). Byte-identical to
+    :func:`_run_directional_signal_series_with_controls`; this is the path the scanner
+    also drives (without the force-close), so paper mirrors the backtest by construction.
+    """
+    res = _kernel.simulate(
+        df, signals, warmup, leverage,
+        regimes=regimes, round_trip_drag=round_trip_drag, trade_mode=trade_mode,
+        allowed_modes=allowed_modes, ec=ec, initial_capital=initial_capital,
+    )
+    return _kernel.force_close(res, df, leverage=leverage, round_trip_drag=round_trip_drag, trade_mode=trade_mode)
+
+
+def _allowed_modes_for(trade_mode: str) -> tuple[str, ...]:
+    if trade_mode == "both":
+        return ("long", "short")
+    if trade_mode == "short_only":
+        return ("short",)
+    return ("long",)
+
+
+def run_strategy_execution(
+    df: "pd.DataFrame",
+    strategy_obj,
+    *,
+    params: dict,
+    warmup: int,
+    leverage: float,
+    fee_bps: float = 4.5,
+    slippage_bps: float = 2.0,
+    regime_gate: bool = True,
+    trade_mode: str = "long_only",
+    execution_controls: dict | None = None,
+    initial_capital: float = 10000.0,
+    strategy_type: str | None = None,
+) -> "_kernel.KernelResult | None":
+    """The ONE signals→regime-mask→kernel pipeline, shared by the backtest's
+    vectorized walk and the live/paper scanner so paper reproduces the backtest by
+    SHARING this code rather than re-implementing it.
+
+    Resolves the strategy's vectorized signals (``generate_signals``), applies the
+    regime gate, resolves the execution profile (or the default 1% fraction sizing),
+    and runs :func:`execution_kernel.simulate`. Returns the :class:`KernelResult`
+    (closed trades + still-open positions) WITHOUT force-closing — the backtest
+    force-closes at the final bar (via :func:`execution_kernel.force_close`), the
+    scanner leaves the position live.
+
+    Returns ``None`` when the strategy exposes no vectorized ``generate_signals`` (the
+    caller falls back to the per-bar slow path); the unified vectorizable builtins all
+    provide one, so this is the common path.
+    """
+    runtime_params = _strategy_runtime_params(params, strategy_obj)
+    vectorized = _resolve_strategy_vectorized_signals(strategy_obj, df)
+    if vectorized is None:
+        return None  # no vectorized signals → caller uses the per-bar slow path
+    if len(df) < warmup + 2:
+        return _kernel.KernelResult()  # signals exist but not enough bars → no trades
+
+    sid = getattr(strategy_obj, "strategy_id", None) or strategy_type or "custom"
+    source = f"strategy:{sid}"
+    default_direction = "short" if trade_mode == "short_only" else str(
+        runtime_params.get("direction") or runtime_params.get("position") or "long"
+    ).strip().lower()
+    signals = _normalize_directional_signal_payload(
+        vectorized, df.index, default_direction=default_direction,
+        trade_mode=trade_mode, label_prefix=source,
+    )
+
+    regime_series = _precompute_regimes(df)
+    entry_allowed, forced_exit, regime_series = _build_regime_gate_masks(
+        df,
+        strategy_type or getattr(strategy_obj, "strategy_type", None),
+        runtime_params,
+        strategy_obj=strategy_obj,
+        regimes=regime_series,
+        regime_gate=regime_gate,
+    )
+    signals.long_entries = signals.long_entries & entry_allowed
+    signals.short_entries = signals.short_entries & entry_allowed
+    signals.long_exits = signals.long_exits | forced_exit
+    signals.short_exits = signals.short_exits | forced_exit
+
+    # Mirror _run_signal_backtest's copy + re-normalize before the kernel.
+    d = df.copy()
+    signals = _normalize_directional_signal_payload(
+        signals, d.index, trade_mode=trade_mode, label_prefix=f"{source}.signals",
+    )
+
+    ec = _normalize_execution_controls(execution_controls)
+    if ec is None:
+        # Honor the strategy's persisted execution_profile when the caller passed no
+        # explicit controls, so the backtest/gauntlet size & stop EXACTLY like paper
+        # (the scanner resolves the same profile via execution_controls_from_params).
+        # Falls back to the default 1% fraction sizing when the strategy has none.
+        ec = _normalize_execution_controls(execution_controls_from_params(params)) or _sizing.default_controls()
+    drag = _kernel.round_trip_drag(fee_bps, slippage_bps, leverage)
+    return _kernel.simulate(
+        d, signals, warmup, leverage,
+        regimes=regime_series, round_trip_drag=drag, trade_mode=trade_mode,
+        allowed_modes=_allowed_modes_for(trade_mode), ec=ec, initial_capital=initial_capital,
+    )
 
 
 
@@ -10103,113 +10228,26 @@ def _run_signal_walk(checker, df, params: dict, warmup: int, leverage: float,
     # The slow walk previously applied no costs, making fallback strategies look free.
     round_trip_drag = 2.0 * (max(float(fee_bps or 0.0), 0.0) + max(float(slippage_bps or 0.0), 0.0)) / 10000.0 * max(float(leverage), 0.0)
 
-    # Optional fast path for dynamic/custom strategies that expose vectorized signals.
-
-
-    vectorized_signals = _resolve_strategy_vectorized_signals(strategy_obj, df)
-
-
-    if vectorized_signals is not None:
-
-
-        source = f"strategy:{getattr(strategy_obj, 'strategy_id', strategy_type or 'custom')}"
-
-
-        try:
-
-
-            default_direction = "short" if trade_mode == "short_only" else str(
-                runtime_params.get("direction") or runtime_params.get("position") or "long"
-            ).strip().lower()
-            signals = _normalize_directional_signal_payload(
-                vectorized_signals,
-                df.index,
-                default_direction=default_direction,
-                trade_mode=trade_mode,
-                label_prefix=source,
-            )
-
-
-            regime_series = _precompute_regimes(df)
-
-
-            entry_allowed, forced_exit, regime_series = _build_regime_gate_masks(
-
-
-                df,
-
-
-                strategy_type or getattr(strategy_obj, "strategy_type", None),
-
-
-                runtime_params,
-
-
-                strategy_obj=strategy_obj,
-
-
-                regimes=regime_series,
-
-
-                regime_gate=regime_gate,
-
-
-            )
-
-
-            signals.long_entries = signals.long_entries & entry_allowed
-            signals.short_entries = signals.short_entries & entry_allowed
-            signals.long_exits = signals.long_exits | forced_exit
-            signals.short_exits = signals.short_exits | forced_exit
-            return _run_signal_backtest(
-
-
-                df,
-
-
-                signals,
-
-
-                warmup,
-
-
-                leverage,
-
-
-                with_regimes=True,
-
-
-                regimes=regime_series,
-
-
-                signal_source=source,
-
-
-                fee_bps=fee_bps,
-
-
-                slippage_bps=slippage_bps,
-
-
-                trade_mode=trade_mode,
-
-                execution_controls=execution_controls,
-
-                initial_capital=initial_capital,
-
-            )
-
-
-        except RuntimeError as exc:
-
-
-            if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
-
-
-                raise
-
-
-
+    # Optional fast path: a strategy exposing vectorized generate_signals runs
+    # through the SAME shared kernel pipeline (run_strategy_execution) the live/paper
+    # scanner drives — so paper reproduces the backtest by construction.
+    try:
+        _kernel_result = run_strategy_execution(
+            df, strategy_obj, params=params, warmup=warmup, leverage=leverage,
+            fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=regime_gate,
+            trade_mode=trade_mode, execution_controls=execution_controls,
+            initial_capital=initial_capital, strategy_type=strategy_type,
+        )
+    except RuntimeError as exc:
+        if _VECTORIZED_PATH_UNAVAILABLE not in str(exc):
+            raise
+        _kernel_result = None
+    if _kernel_result is not None:
+        return _kernel.force_close(
+            _kernel_result, df, leverage=leverage,
+            round_trip_drag=_kernel.round_trip_drag(fee_bps, slippage_bps, leverage),
+            trade_mode=trade_mode,
+        )
 
 
     # Fast path: vectorized signal generation for built-in strategy types.

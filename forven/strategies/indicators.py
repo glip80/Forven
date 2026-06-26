@@ -471,12 +471,13 @@ def _f_supertrend(df, p, i):
             st[k] = upper[k]
             direction[k] = -1.0
             continue
-        final_upper[k] = (
-            upper[k] if (upper[k] < final_upper[k - 1] or close[k - 1] > final_upper[k - 1]) else final_upper[k - 1]
-        )
-        final_lower[k] = (
-            lower[k] if (lower[k] > final_lower[k - 1] or close[k - 1] < final_lower[k - 1]) else final_lower[k - 1]
-        )
+        # Seed the trailing bands from the prior bar, falling back to this bar's
+        # basic band when the prior is still NaN (the ATR warmup window). Without
+        # this, the NaN propagates forever and direction stays pinned at -1.
+        fu_prev = final_upper[k - 1] if np.isfinite(final_upper[k - 1]) else upper[k]
+        fl_prev = final_lower[k - 1] if np.isfinite(final_lower[k - 1]) else lower[k]
+        final_upper[k] = upper[k] if (upper[k] < fu_prev or close[k - 1] > fu_prev) else fu_prev
+        final_lower[k] = lower[k] if (lower[k] > fl_prev or close[k - 1] < fl_prev) else fl_prev
         prev_dir = direction[k - 1]
         if prev_dir == 1.0:
             direction[k] = -1.0 if close[k] < final_lower[k] else 1.0
