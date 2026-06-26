@@ -80,3 +80,61 @@ def test_fetch_binance_candles_drops_unclosed_bar(monkeypatch):
     assert last_open_ms + interval_ms <= end
     assert last_open_ms == 9 * interval_ms  # the unclosed open=end bar was dropped
     assert isinstance(df.index, pd.DatetimeIndex) and str(df.index.tz) == "UTC"
+
+
+class _FakeFuturesExchange:
+    def __init__(self, funding=None, oi=None):
+        self._funding = funding or []
+        self._oi = oi or []
+        self.funding_calls = 0
+
+    def fetch_funding_rate_history(self, symbol, since=None, limit=None):
+        self.funding_calls += 1
+        rows = [r for r in self._funding if since is None or r["timestamp"] >= since]
+        return rows[: (limit or len(rows))]
+
+    def fetch_funding_rate(self, symbol):
+        return self._funding[-1] if self._funding else {"fundingRate": None}
+
+    def fetch_open_interest_history(self, symbol, timeframe, since=None, limit=None):
+        return self._oi
+
+
+def test_binance_funding_series_is_expressed_per_hour(monkeypatch):
+    md._FUNDING_SERIES_CACHE.clear()
+    # Binance reports an 8h rate; the series must divide by 8 (per-hour) so it
+    # accrues via _apply_funding_to_trades exactly like the hourly HL series.
+    funding = [{"timestamp": 1000, "fundingRate": 0.0008}, {"timestamp": 2000, "fundingRate": 0.0016}]
+    monkeypatch.setattr(md, "_binance_futures_exchange", lambda: _FakeFuturesExchange(funding=funding))
+    series = md.fetch_binance_funding_series("BTC", start_ms=1000, end_ms=10000)
+    assert series == [(1000, 0.0008 / 8), (2000, 0.0016 / 8)]
+
+
+def test_binance_funding_series_caches(monkeypatch):
+    md._FUNDING_SERIES_CACHE.clear()
+    fake = _FakeFuturesExchange(funding=[{"timestamp": 1000, "fundingRate": 0.0008}])
+    monkeypatch.setattr(md, "_binance_futures_exchange", lambda: fake)
+    md.fetch_binance_funding_series("BTC", start_ms=1000, end_ms=10000)
+    md.fetch_binance_funding_series("BTC", start_ms=1000, end_ms=10000)
+    assert fake.funding_calls == 1  # second call served from cache
+
+
+def test_market_funding_rate_dispatches_on_source(monkeypatch):
+    monkeypatch.setattr(md, "fetch_binance_funding_rate", lambda c: 0.111)
+    monkeypatch.setattr(md, "fetch_hyperliquid_funding_rate", lambda c: 0.999)
+    monkeypatch.setattr(md, "resolve_market_data_source", lambda: "binance")
+    assert md.fetch_market_funding_rate("BTC") == 0.111
+    monkeypatch.setattr(md, "resolve_market_data_source", lambda: "hyperliquid")
+    assert md.fetch_market_funding_rate("BTC") == 0.999
+
+
+def test_enrich_series_helper_uses_binance_when_configured(monkeypatch):
+    import forven.strategies.backtest as bt
+
+    monkeypatch.setattr(md, "resolve_market_data_source", lambda: "binance")
+    monkeypatch.setattr(md, "fetch_binance_funding_series", lambda *a, **k: [(1000, 0.0001)])
+    monkeypatch.setattr(md, "fetch_binance_oi_series", lambda *a, **k: [(1000, 5.0)])
+    # If it touched HL the import below would be the wrong source; assert Binance data flows.
+    funding, oi = bt._resolve_market_data_series("BTC", 0, 10000)
+    assert funding == [(1000, 0.0001)]
+    assert oi == [(1000, 5.0)]

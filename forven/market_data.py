@@ -534,3 +534,116 @@ class BinancePriceFeed:
                 log.warning("BinancePriceFeed poll failed: %s", exc)
                 await asyncio.sleep(min(delay, 30.0))
                 delay = min(delay * 2, 30.0)
+
+
+# ─── Binance derivatives data (funding + open interest) ──────────────────────
+# Backtest AND paper read the SAME funding/OI columns (via backtest._enrich_with_
+# market_data). Sourcing them from Binance — like the candles — keeps the two
+# engines on one venue. Binance funds every 8h; we express the rate PER HOUR
+# (rate / 8) so it merges onto the candle grid and accrues exactly like the
+# (hourly) HyperLiquid series did — one funding convention across both engines.
+_FUTURES_BINANCE_EXCHANGE = None
+_BINANCE_FUNDING_INTERVAL_HOURS = 8.0
+_FUNDING_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
+_OI_SERIES_CACHE: dict[str, tuple[float, list[tuple[int, float]]]] = {}
+_SERIES_CACHE_TTL = 300.0  # funding events are 8h apart; 5-min cache is plenty
+
+
+def _binance_futures_exchange():
+    """Lazy ccxt Binance USDⓈ-M FUTURES client (funding/OI live on the perp venue)."""
+    global _FUTURES_BINANCE_EXCHANGE
+    if _FUTURES_BINANCE_EXCHANGE is None:
+        import ccxt
+
+        _FUTURES_BINANCE_EXCHANGE = ccxt.binance(
+            {"options": {"defaultType": "future"}, "enableRateLimit": True}
+        )
+    return _FUTURES_BINANCE_EXCHANGE
+
+
+def _fetch_binance_funding_series_raw(symbol: str, start_ms: int, end_ms: int) -> list[tuple[int, float]]:
+    exchange = _binance_futures_exchange()
+    out: list[tuple[int, float]] = []
+    since = int(start_ms)
+    per_call = 1000
+    for _ in range(60):  # bound pagination (60*1000 events ≫ any window)
+        batch = exchange.fetch_funding_rate_history(symbol, since=since, limit=per_call)
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row.get("timestamp") or 0)
+            rate = row.get("fundingRate")
+            if ts and rate is not None and ts <= end_ms:
+                out.append((ts, float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS))
+        last_ts = int(batch[-1].get("timestamp") or 0)
+        if len(batch) < per_call or last_ts >= end_ms or last_ts <= since:
+            break
+        since = last_ts + 1
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
+def fetch_binance_funding_series(coin: str, start_ms: int | None = None, end_ms: int | None = None) -> list[tuple[int, float]]:
+    """Binance funding as (timestamp_ms, PER-HOUR rate) pairs over a window — a
+    drop-in for ``market_data_collector.get_funding_rate_series`` (which is HL)."""
+    symbol = _binance_symbol(coin)
+    now = time.time()
+    end_ms = int(end_ms) if end_ms else int(now * 1000)
+    start_ms = int(start_ms) if start_ms else end_ms - 730 * 24 * 3600 * 1000
+    cached = _FUNDING_SERIES_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _SERIES_CACHE_TTL and cached[1] and cached[1][0][0] <= start_ms:
+        series = cached[1]
+    else:
+        series = _fetch_binance_funding_series_raw(symbol, start_ms, end_ms)
+        if series:
+            _FUNDING_SERIES_CACHE[symbol] = (now, series)
+    return [(ts, rate) for ts, rate in series if start_ms <= ts <= end_ms]
+
+
+def fetch_binance_oi_series(coin: str, start_ms: int | None = None, end_ms: int | None = None, *, interval: str = "1h") -> list[tuple[int, float]]:
+    """Binance open interest as (timestamp_ms, OI) pairs — best-effort. Binance's
+    openInterestHist only covers ~30 days, so deep-history bars have no OI (the
+    column stays sparse, matching the graceful "absent → zeros" handling)."""
+    symbol = _binance_symbol(coin)
+    now = time.time()
+    end_ms = int(end_ms) if end_ms else int(now * 1000)
+    start_ms = int(start_ms) if start_ms else end_ms - 30 * 24 * 3600 * 1000
+    cached = _OI_SERIES_CACHE.get(symbol)
+    if cached and (now - cached[0]) < _SERIES_CACHE_TTL:
+        series = cached[1]
+    else:
+        try:
+            exchange = _binance_futures_exchange()
+            batch = exchange.fetch_open_interest_history(symbol, interval, since=int(start_ms), limit=500)
+        except Exception:
+            batch = []
+        series = []
+        for row in batch or []:
+            ts = int(row.get("timestamp") or 0)
+            oi = row.get("openInterestAmount")
+            if oi is None and isinstance(row.get("info"), dict):
+                oi = row["info"].get("sumOpenInterest")
+            if ts and oi is not None:
+                series.append((ts, float(oi)))
+        series.sort(key=lambda pair: pair[0])
+        _OI_SERIES_CACHE[symbol] = (now, series)
+    return [(ts, oi) for ts, oi in series if start_ms <= ts <= end_ms]
+
+
+def fetch_binance_funding_rate(coin: str) -> float | None:
+    """Latest Binance funding rate as a PER-HOUR rate (rate/8). Source-aware
+    drop-in for ``fetch_hyperliquid_funding_rate``."""
+    try:
+        exchange = _binance_futures_exchange()
+        info = exchange.fetch_funding_rate(_binance_symbol(coin))
+        rate = info.get("fundingRate") if isinstance(info, dict) else None
+        return None if rate is None else float(rate) / _BINANCE_FUNDING_INTERVAL_HOURS
+    except Exception:
+        return None
+
+
+def fetch_market_funding_rate(coin: str) -> float | None:
+    """Source-aware latest funding rate: Binance (default) or HyperLiquid."""
+    if resolve_market_data_source() == "binance":
+        return fetch_binance_funding_rate(coin)
+    return fetch_hyperliquid_funding_rate(coin)

@@ -42,6 +42,8 @@ from forven.market_data import (
     fetch_hyperliquid_candles,
     fetch_hyperliquid_funding_rate,
     fetch_market_candles,
+    fetch_market_funding_rate,
+    resolve_market_data_source,
     dataframe_to_ohlcv_rows,
     ohlcv_rows_to_dataframe,
 )
@@ -633,6 +635,10 @@ def _load_live_price_cache() -> tuple[dict[str, float], float | None]:
             return load_price_snapshot()
     except Exception:
         pass
+    # Binance source (default): the daemon's price snapshot is already Binance
+    # (BinancePriceFeed) — don't make a direct HyperLiquid call for paper data.
+    if resolve_market_data_source() == "binance":
+        return load_price_snapshot()
     try:
         from forven.exchange.hyperliquid import get_all_mids
         prices = get_all_mids()
@@ -1689,9 +1695,9 @@ def _enrich_scan_frame(df: pd.DataFrame, asset: str, timeframe: str) -> pd.DataF
     silently dead in paper, returning none-signals on every scan forever.
 
     Mirrors the backtest recipe exactly (see backtest.load_backtest_candles):
-    funding/OI come from _enrich_with_market_data (Hyperliquid, hourly funding);
-    data_manager.enrich adds order-flow streams only — its Binance per-8h
-    funding parquet must NOT replace the hourly funding_rate column.
+    funding/OI come from _enrich_with_market_data (source-aware — Binance by
+    default, expressed per-hour, so backtest and paper agree on one venue);
+    data_manager.enrich adds order-flow streams only.
     """
     if df is None or df.empty:
         return df
@@ -2049,7 +2055,7 @@ def check_keltner_signal(df: pd.DataFrame, p: dict) -> dict:
 def check_funding_signal(df: pd.DataFrame, p: dict, coin: str = "BTC") -> dict:
     """Funding rate mean reversion: LONG when funding extremely negative, exit when neutral."""
     try:
-        funding = fetch_hyperliquid_funding_rate(coin)
+        funding = fetch_market_funding_rate(coin)
         if funding is None:
             return {"price": df.iloc[-1]["close"], "funding": 0, "adx": 0, "entry_signal": False, "exit_signal": False, "direction": "long"}
     except Exception:
@@ -2088,7 +2094,7 @@ def check_funding_direction_signal(df: pd.DataFrame, p: dict, coin: str = "BTC")
     """
     try:
         # Get current funding rate
-        funding = fetch_hyperliquid_funding_rate(coin)
+        funding = fetch_market_funding_rate(coin)
         if funding is None:
             return {"price": df.iloc[-1]["close"], "funding": 0, "funding_direction": 0, "adx": 0, "entry_signal": False, "exit_signal": False, "direction": "long"}
     except Exception:
@@ -2160,7 +2166,7 @@ def check_funding_reversion_signal(df: pd.DataFrame, p: dict, coin: str = "BTC")
 
     if funding is None:
         try:
-            funding = fetch_hyperliquid_funding_rate(coin)
+            funding = fetch_market_funding_rate(coin)
         except Exception:
             pass
 

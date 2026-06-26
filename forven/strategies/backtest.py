@@ -2109,35 +2109,53 @@ def load_multi_exchange_candles(
 
 
 
-def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
-    """Join supplementary market data (funding rate, OI) into backtest DataFrame.
+def _resolve_market_data_series(normalized_asset: str, start_ms: int, end_ms: int):
+    """(funding, oi) as (timestamp_ms, value) lists from the configured market-data
+    source. Binance (default) keeps the backtest AND paper on ONE venue (no HL);
+    HyperLiquid is the opt-out (with its self-healing backfill)."""
+    from forven.market_data import resolve_market_data_source
 
-    Aligns market_data_history records to candle timestamps using
-    nearest-backward merge (each candle gets the most recent data point
-    at or before its timestamp).
+    if resolve_market_data_source() == "binance":
+        from forven.market_data import fetch_binance_funding_series, fetch_binance_oi_series
+
+        return (
+            fetch_binance_funding_series(normalized_asset, start_ms, end_ms),
+            fetch_binance_oi_series(normalized_asset, start_ms, end_ms),
+        )
+
+    from forven.market_data_collector import (
+        ensure_funding_history,
+        get_funding_rate_series,
+        get_open_interest_series,
+    )
+
+    # Self-healing backfill for the HL store so a fresh install converges.
+    try:
+        heal = ensure_funding_history(normalized_asset, start_ms)
+        if heal.get("action") == "backfilled":
+            log.info(
+                "Self-healed funding history for %s: %s records (oldest %s)",
+                normalized_asset, heal.get("stored"), heal.get("oldest_record"),
+            )
+    except Exception as exc:
+        log.debug("Funding self-heal skipped for %s: %s", normalized_asset, exc)
+
+    return (
+        get_funding_rate_series(normalized_asset, start_ms=start_ms, end_ms=end_ms),
+        get_open_interest_series(normalized_asset, start_ms=start_ms, end_ms=end_ms),
+    )
+
+
+def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+    """Join supplementary market data (funding rate, OI) into the candle DataFrame,
+    from the configured source (Binance by default — same venue as the candles, so
+    backtest and paper agree). Aligns records to candle timestamps via a
+    nearest-backward merge (each candle gets the most recent point at/before it).
     """
     if df is None or df.empty:
         return df
     try:
-        from forven.market_data_collector import get_funding_rate_series, get_open_interest_series
-
         normalized_asset = str(asset or "").strip().upper().replace("/USDT", "").replace("/USD", "")
-
-        # Self-healing: if stored funding history doesn't reach back to this
-        # window, backfill it from the exchange before merging. A fresh install
-        # (or factory reset) converges to full coverage on first use instead of
-        # silently running funding-blind until someone runs a CLI backfill.
-        try:
-            from forven.market_data_collector import ensure_funding_history
-
-            heal = ensure_funding_history(normalized_asset, int(df.index[0].timestamp() * 1000))
-            if heal.get("action") == "backfilled":
-                log.info(
-                    "Self-healed funding history for %s: %s records (oldest %s)",
-                    normalized_asset, heal.get("stored"), heal.get("oldest_record"),
-                )
-        except Exception as exc:
-            log.debug("Funding self-heal skipped for %s: %s", normalized_asset, exc)
 
         # pandas>=2 carries a datetime resolution (ns/us/ms) on each index, and
         # merge_asof REQUIRES both keys to share the exact same resolution. The
@@ -2151,8 +2169,10 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
         start_ms = int(df.index[0].timestamp() * 1000)
         end_ms = int(df.index[-1].timestamp() * 1000)
 
+        # Source-aware funding + OI (Binance by default — no HyperLiquid).
+        funding_data, oi_data = _resolve_market_data_series(normalized_asset, start_ms, end_ms)
+
         # Funding rates
-        funding_data = get_funding_rate_series(normalized_asset, start_ms=start_ms, end_ms=end_ms)
         if funding_data:
             fr_df = pd.DataFrame(funding_data, columns=["timestamp_ms", "funding_rate"])
             fr_df["t"] = pd.to_datetime(fr_df["timestamp_ms"], unit="ms", utc=True)
@@ -2167,7 +2187,6 @@ def _enrich_with_market_data(df: pd.DataFrame, asset: str) -> pd.DataFrame:
             log.debug("Enriched %s with %d funding rate records", asset, len(fr_df))
 
         # Open interest
-        oi_data = get_open_interest_series(normalized_asset, start_ms=start_ms, end_ms=end_ms)
         if oi_data:
             oi_df = pd.DataFrame(oi_data, columns=["timestamp_ms", "open_interest"])
             oi_df["t"] = pd.to_datetime(oi_df["timestamp_ms"], unit="ms", utc=True)
