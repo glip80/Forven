@@ -5692,12 +5692,28 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     close_applier = _kernel_close_live_trade if is_live else _kernel_close_paper_trade
     label = "live" if is_live else "paper"
 
+    # A LATE hop-in must enter at the REAL current price/time — NOT the last CLOSED bar,
+    # whose close is the price as of its END (up to a full timeframe stale: a 4h bar closed
+    # at 16:00 is ~hours old by an 18:45 scan) and whose open timestamp would mis-place the
+    # marker on an old candle. Use the live-price cache (the same mark the dashboard shows)
+    # + wall-clock now; fall back to the closed-bar close only if the live mark is
+    # missing/stale. (Faithful kernel opens ignore these; only late entries use them.)
+    hop_price, hop_time = last_close, last_time
+    if any(a.kind == "open" and getattr(a, "late_entry", False) for a in actions_plan):
+        try:
+            _lp_prices, _lp_age = _load_live_price_cache()
+            _lp = _coerce_positive_float((_lp_prices or {}).get(asset))
+            if _lp and (_lp_age is None or _lp_age <= _PRICE_CACHE_STALE_SECONDS):
+                hop_price, hop_time = _lp, get_now().isoformat()
+        except Exception:
+            pass
+
     out: list[str] = []
     for a in actions_plan:
         try:
             if a.kind == "open":
                 msg = open_applier(strat_id, strat, a, sizing_equity=sizing_equity, leverage=leverage,
-                                   current_price=last_close, current_time=last_time)
+                                   current_price=hop_price, current_time=hop_time)
             elif a.kind in ("close", "backfill"):
                 msg = close_applier(strat_id, strat, a)
             elif a.kind == "refresh":
