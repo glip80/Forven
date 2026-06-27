@@ -43,6 +43,13 @@ HONORED_EXECUTION_CONTROL_FIELDS = (
 # positions" floor the operator asked for.
 DEFAULT_RISK_PER_TRADE = 0.01
 
+# Default per-trade risk for a CONFIGURED profile (sizing_mode set) that omits an
+# explicit risk_per_trade — 2%, matching the frontend "fraction"/"atr" presets. This
+# is deliberately distinct from DEFAULT_RISK_PER_TRADE (the no-profile fallback): a
+# profile that opts into risk-sizing accepts a slightly higher default. Named so the
+# 1%-vs-2% split is explicit, not a bare magic number.
+DEFAULT_PROFILE_RISK_PER_TRADE = 0.02
+
 # The default risk engine sizes that 1% against a 2x-ATR stop (an industry-standard
 # volatility stop) which is ALSO placed as a real stop on the position. When ATR is
 # unavailable (e.g. a flat warmup window) the sizing/stop fall back to a fixed
@@ -145,7 +152,7 @@ def normalize_execution_controls(controls: dict | None) -> dict | None:
     if time_stop_bars is not None and time_stop_bars <= 0:
         time_stop_bars = None
 
-    risk_per_trade = _opt_pos("risk_per_trade") or 0.02
+    risk_per_trade = _opt_pos("risk_per_trade") or DEFAULT_PROFILE_RISK_PER_TRADE
     fixed_size = _opt_pos("fixed_size")
     atr_stop_multiplier = _opt_pos("atr_stop_multiplier") or 2.0
     kelly_multiplier = _opt_pos("kelly_multiplier") or 0.5

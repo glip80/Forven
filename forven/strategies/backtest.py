@@ -480,6 +480,16 @@ def _isolated_walk_forward_worker(
             "out_of_sample": {"trades": len(oos_trades), **oos_metrics},
         })
 
+    if not splits:
+        # Every fold was skipped (each in-sample slice fell below warmup+min-eval, or
+        # OOS was too short). Surface this as an explicit error so callers distinguish
+        # "window too small to evaluate" from a genuine robustness FAIL (which otherwise
+        # rejects every optimization candidate at the acceptance precheck).
+        return {"error": (
+            "walk-forward produced no evaluable folds: the window is too small for the "
+            "fold count (each fold needs >= warmup+min-eval in-sample bars). Use a longer "
+            "window or fewer folds."
+        )}
     return {"splits": splits, "all_oos_trades": all_oos_trades}
 
 
@@ -6280,6 +6290,15 @@ def _apply_funding_to_trades(
     for t in trades:
         entry_bar = max(int(t.get("entry_bar", 0)), 0)
         bars_held = max(int(t.get("bars_held", 0)), 0)
+        if bars_held <= 0:
+            # Zero-bar trade (e.g. a final-bar entry force-closed at the same bar) holds
+            # no funding interval — it is trivially complete, not "funding-incomplete".
+            # Without this a single such trade would set funding_complete=False and
+            # spuriously block the strategy's promotion to live.
+            t["funding_cost_pct"] = 0.0
+            t["funding_applied"] = True
+            t["funding_complete"] = True
+            continue
         exit_bar = min(entry_bar + bars_held, n)
         window = fr.iloc[entry_bar:exit_bar]
         complete = bool(len(window)) and not bool(window.isna().any())
@@ -6287,8 +6306,10 @@ def _apply_funding_to_trades(
         sign = _trade_direction_sign(str(t.get("direction", "long")))
         # funding_pnl < 0 for a long when funding_rate > 0 (long pays the funding).
         # Funding accrues on the actual notional held, so it scales with the
-        # position's size_fraction (1.0 for the legacy full-notional path).
-        size_fraction = float(t.get("size_fraction", 1.0) or 1.0)
+        # position's size_fraction (1.0 for the legacy full-notional path). Read the
+        # FULL-precision size_fraction the price-PnL leg used (size_fraction_raw),
+        # falling back to the 4dp display value for non-kernel trade producers.
+        size_fraction = float(t.get("size_fraction_raw", t.get("size_fraction", 1.0)) or 1.0)
         funding_pnl = -sign * funding_sum * hours * lev * size_fraction
         t["funding_cost_pct"] = round(float(funding_pnl), 6)
         t["funding_applied"] = True
@@ -6560,6 +6581,9 @@ def _run_directional_signal_series_with_controls(
             "trade_mode": trade_mode,
             "position_model": "hedged" if trade_mode == "both" else "single_side",
             "size_fraction": round(size_fraction, 4),
+            # Full-precision fraction (the display field above is rounded to 4dp); the
+            # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
+            "size_fraction_raw": size_fraction,
             "exit_reason": exit_reason,
         }
         if open_at_end:
@@ -6589,6 +6613,15 @@ def _run_directional_signal_series_with_controls(
 
             if ec["time_stop_bars"] and (idx - int(at["entry_bar"])) >= ec["time_stop_bars"]:
                 exit_price, exit_reason = fill_price, "time_stop"
+
+            # Signal-driven exit (decided at the prior bar's close → a market-on-open
+            # order that fills at THIS bar's open). Because the open is the first tick of
+            # the bar, it must pre-empt any intrabar stop/take-profit that would only
+            # trigger later within the same bar — evaluated here, before the stop/TP.
+            if exit_price is None:
+                exit_series = signals.long_exits if direction == "long" else signals.short_exits
+                if bool(exit_series.iloc[signal_idx]):
+                    exit_price, exit_reason = fill_price, "signal"
 
             # Combine fixed stop and trailing stop into the tighter effective level.
             # The trailing level uses the peak through the PRIOR bar (at["extreme"]);
@@ -6629,22 +6662,16 @@ def _run_directional_signal_series_with_controls(
                 # Still open — ratchet the trailing peak with THIS bar for the next bar.
                 at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
 
-        # (2) Signal-driven exits (fill at this bar's open).
-        for direction in allowed_modes:
-            exit_series = signals.long_exits if direction == "long" else signals.short_exits
-            at = active_trades.get(direction)
-            if at is None or not bool(exit_series.iloc[signal_idx]):
-                continue
-            _finalize(at, direction, fill_price, idx, current_time, "signal")
-            active_trades[direction] = None
-
-        # (3) Signal-driven entries (fill at this bar's open).
+        # (2) Signal-driven entries (fill at this bar's open).
         for direction in allowed_modes:
             entry_series = signals.long_entries if direction == "long" else signals.short_entries
             if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
                 continue
             sign = _trade_direction_sign(direction)
-            stop_dist_pct = _entry_stop_dist_pct(idx, fill_price)
+            # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
+            # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
+            # high/low/close at the open where the fill happens — a forward-looking read.
+            stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
             stop_price = None
             if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
                 stop_price = fill_price * (1.0 - sign * stop_dist_pct)
@@ -7171,6 +7198,39 @@ def _run_remote_backtest(
 
 
 
+def resolve_default_leverage(settings: dict | None = None) -> float:
+    """The operator-configured fallback leverage used when a strategy declares none.
+
+    ONE source of truth so the gauntlet confirmation/robustness backtests, the
+    execution-profile selection, and the live/paper scanner all size leverage-sensitive
+    profiles (full/fixed/kelly) identically — the parity invariant. Defaults to 1x.
+    """
+    try:
+        if settings is None:
+            from forven.api_core import get_settings
+            settings = get_settings()
+        v = float((settings or {}).get("default_leverage", 1.0))
+        return v if (np.isfinite(v) and v > 0) else 1.0
+    except Exception:
+        return 1.0
+
+
+def resolve_leverage(params: dict | None, explicit: float | None = None, *, settings: dict | None = None) -> float:
+    """Resolve leverage for a NEW backtest/trade: an explicit arg wins, then the
+    strategy's declared ``params['leverage']``, then the operator ``default_leverage``."""
+    candidates = [explicit]
+    if isinstance(params, dict):
+        candidates.append(params.get("leverage"))
+    for cand in candidates:
+        try:
+            v = float(cand)
+            if np.isfinite(v) and v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return resolve_default_leverage(settings)
+
+
 def backtest_strategy(
 
 
@@ -7292,13 +7352,11 @@ def backtest_strategy(
     # reflect the leverage the strategy actually declares (e.g. 1.0). Falls back to 3.0
     # only when the strategy declares nothing usable, preserving prior behavior there.
     if leverage is None:
-        _declared_lev = params.get("leverage")
-        try:
-            leverage = float(_declared_lev)
-        except (TypeError, ValueError):
-            leverage = 3.0
-        if not np.isfinite(leverage) or leverage <= 0:
-            leverage = 3.0
+        # Use the strategy's declared leverage, else the operator-configurable
+        # default_leverage (1x) — the SAME default paper/selection use, so the
+        # confirmation/robustness backtests size leverage-sensitive profiles the way
+        # the strategy will actually trade (parity). Was a hardcoded 3x.
+        leverage = resolve_leverage(params)
     if bars is not None and (not isinstance(bars, int) or isinstance(bars, bool) or bars <= 0):
         raise ValueError(f"backtest_strategy: bars must be a positive int or None, got {bars!r}")
     if not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or not np.isfinite(leverage) or leverage <= 0:
@@ -8046,6 +8104,12 @@ def backtest_strategy(
 
 
         "sharpe_is_reliable": bool(oos_metrics.get("sharpe_is_reliable", False)),
+
+
+        # Surface Sortino top-level too (mirrors "sharpe") so the execution-profile
+        # selector's --objective sortino actually scores by Sortino instead of
+        # silently falling back to Sharpe.
+        "sortino": oos_metrics.get("sortino", 0.0),
 
 
         "max_drawdown_pct": oos_metrics.get("max_drawdown_pct", 0.0),
@@ -8804,7 +8868,7 @@ def compute_metrics(
     metrics = _compute_basic_metrics(trades, total_bars, timeframe=timeframe, symbol=symbol)
 
 
-    backtest_months = _compute_backtest_months(start_date, end_date, total_bars)
+    backtest_months = _compute_backtest_months(start_date, end_date, total_bars, timeframe=timeframe)
 
 
     total_return_ratio = float(metrics.get("total_return_pct", 0.0))
@@ -9086,10 +9150,12 @@ def _compute_basic_metrics(trades: list[dict], total_bars: int, *, timeframe: st
     if len(pnls) > 1:
 
 
-        downside = [min(0, p) for p in pnls]
-
-
-        downside_std = float(np.std(downside))
+        # Target semideviation about MAR=0: the root-mean-square of the NEGATIVE
+        # returns (divided by the TOTAL observation count). NOT np.std — that would
+        # subtract the mean of the downside list, shrinking the denominator and
+        # systematically OVERSTATING Sortino.
+        downside_sq = [min(0.0, float(p)) ** 2 for p in pnls]
+        downside_std = float(np.sqrt(np.sum(downside_sq) / len(pnls)))
 
 
         trades_per_year = len(pnls) / (total_bars / bars_per_year) if total_bars > 0 else len(pnls)
@@ -9224,10 +9290,17 @@ def _compute_backtest_months(
     total_bars: int,
 
 
+    timeframe: str = "1h",
+
+
 ) -> float:
 
 
-    """Estimate backtest span in months from timestamps, falling back to bar count."""
+    """Estimate backtest span in months from timestamps, falling back to bar count.
+
+    The bar-count fallback is TIMEFRAME-AWARE: a bar is not always one hour. Using a
+    hardcoded 24 bars/day corrupts CAGR/monthly-return on every non-1h timeframe.
+    """
 
 
     months_from_dates = 0.0
@@ -9272,7 +9345,9 @@ def _compute_backtest_months(
         return 0.0
 
 
-    return float(total_bars) / (24.0 * 30.4375)
+    # Timeframe-aware: 12 months == bars_per_year bars for THIS timeframe.
+    bars_per_year = float(_BARS_PER_YEAR.get(str(timeframe or "1h").strip().lower(), 8760)) or 8760.0
+    return float(total_bars) / bars_per_year * 12.0
 
 
 
@@ -9536,7 +9611,7 @@ def walk_forward(
     n_splits: int | None = None,
 
 
-    leverage: float = 3.0,
+    leverage: float | None = None,
 
 
     fee_bps: float | None = None,
@@ -9637,6 +9712,11 @@ def walk_forward(
         raise ValueError(f"walk_forward: in_sample_pct must be a float in (0, 1) or None, got {in_sample_pct!r}")
     if n_splits is not None and (not isinstance(n_splits, int) or isinstance(n_splits, bool) or n_splits <= 0):
         raise ValueError(f"walk_forward: n_splits must be a positive int or None, got {n_splits!r}")
+    # None → strategy's declared leverage, else the operator default_leverage (1x),
+    # so a caller that omits leverage (e.g. the robustness WFA leg) matches the
+    # confirmation backtest rather than a hardcoded 3x.
+    if leverage is None:
+        leverage = resolve_leverage(params)
     if not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or not np.isfinite(leverage) or leverage <= 0:
         raise ValueError(f"walk_forward: leverage must be a positive finite number, got {leverage!r}")
 
@@ -10016,19 +10096,31 @@ def walk_forward(
 
     if "error" in worker_result:
         log.warning("Isolated walk-forward failed for %s: %s", strategy_id, worker_result["error"])
-        return {"error": worker_result["error"]}
+        # Preserve the risk-control parity warning even when the fold evaluation could
+        # not run (e.g. window too small for the fold count) — it is an independent
+        # pre-flight validation, not contingent on the WFA succeeding.
+        err_result = {"error": worker_result["error"]}
+        if risk_parity_warning:
+            err_result["warning"] = risk_parity_warning
+        return err_result
 
     splits = worker_result["splits"]
     all_oos_trades = worker_result["all_oos_trades"]
 
 
 
-    # Aggregate out-of-sample metrics
+    # Aggregate out-of-sample metrics.
+    # Time base = the SUMMED out-of-sample bar span (not the full IS+OOS window):
+    # all_oos_trades only span the OOS slices (~1-in_sample_pct of each fold), so using
+    # the full window deflates trades_per_year and understates the pooled OOS Sharpe.
+    # No dates are passed because the pooled OOS folds are non-contiguous in calendar
+    # time; the timeframe-aware bar→months conversion is the honest span.
+    oos_total_bars = sum(int(s.get("oos_bars", 0) or 0) for s in splits) or resolved_total_bars
 
 
     agg_oos = compute_metrics(
         all_oos_trades,
-        resolved_total_bars,
+        oos_total_bars,
         timeframe=resolved_timeframe,
         trade_mode=resolved_trade_mode,
     )

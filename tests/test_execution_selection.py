@@ -86,6 +86,68 @@ def test_select_keeps_default_when_nothing_beats_it(monkeypatch):
     assert out["chosen"] is None  # default engine wins → no profile imposed
 
 
+def test_dd_guard_uses_backtest_metric_key(monkeypatch):
+    """The drawdown guard must read the SAME key the backtest actually emits
+    (``max_drawdown_pct``); otherwise a catastrophic-drawdown profile with the best
+    Sharpe slips through (the dead-guard bug)."""
+    metrics = {
+        "default": {"sharpe_ratio": 0.4, "total_trades": 40, "max_drawdown_pct": 0.20, "total_return_pct": 0.1},
+        ("fraction", 0.05): {"sharpe_ratio": 2.5, "total_trades": 30, "max_drawdown_pct": 0.92, "total_return_pct": 1.4},
+    }
+    monkeypatch.setattr("forven.strategies.backtest.backtest_strategy", _fake_backtest(metrics))
+    out = sel.select_execution_profile(
+        strategy_id="S1", asset="BTC", strategy_type="rsi_momentum", params={}, timeframe="1h",
+        candidates=[None, {"sizing_mode": "fraction", "risk_per_trade": 0.05, "stop_loss_pct": 3.0}],
+        objective="sharpe_ratio", max_dd=0.50, min_trades=10,
+    )
+    frac = next(s for s in out["scored"] if s["profile"])
+    assert frac["max_drawdown"] == pytest.approx(0.92)  # read from max_drawdown_pct
+    assert frac["eligible"] is False  # 92% DD disqualified despite best Sharpe
+    assert out["chosen"] is None  # default kept
+
+
+def test_no_eligible_candidate_falls_back_to_default(monkeypatch):
+    """When nothing clears the DD guard, keep the conservative default engine rather
+    than freezing the highest-drawdown Sharpe winner."""
+    metrics = {
+        "default": {"sharpe_ratio": 0.3, "total_trades": 40, "max_drawdown_pct": 0.60, "total_return_pct": 0.08},
+        ("fraction", 0.05): {"sharpe_ratio": 3.0, "total_trades": 30, "max_drawdown_pct": 0.95, "total_return_pct": 2.0},
+    }
+    monkeypatch.setattr("forven.strategies.backtest.backtest_strategy", _fake_backtest(metrics))
+    out = sel.select_execution_profile(
+        strategy_id="S1", asset="BTC", strategy_type="rsi_momentum", params={}, timeframe="1h",
+        candidates=[None, {"sizing_mode": "fraction", "risk_per_trade": 0.05, "stop_loss_pct": 3.0}],
+        objective="sharpe_ratio", max_dd=0.50, min_trades=10,
+    )
+    assert not [s for s in out["scored"] if s.get("eligible")]  # both exceed max_dd
+    assert out["chosen"] is None  # the 95%-DD profile is NOT frozen
+
+
+def test_degenerate_zero_size_candidate_not_chosen(monkeypatch):
+    """A zero-size kelly (score 0, return 0) must not outrank a real (negative-Sharpe)
+    candidate and be frozen as the engine."""
+    metrics = {
+        "default": {"sharpe_ratio": -0.5, "total_trades": 40, "max_drawdown_pct": 0.20, "total_return_pct": -0.1},
+        ("kelly", None): {"sharpe_ratio": 0.0, "total_trades": 12, "max_drawdown_pct": 0.0, "total_return_pct": 0.0},
+    }
+    monkeypatch.setattr("forven.strategies.backtest.backtest_strategy", _fake_backtest(metrics))
+    out = sel.select_execution_profile(
+        strategy_id="S1", asset="BTC", strategy_type="rsi_momentum", params={}, timeframe="1h",
+        candidates=[None, {"sizing_mode": "kelly", "kelly_multiplier": 0.5}],
+        objective="sharpe_ratio", max_dd=0.50, min_trades=10,
+    )
+    kelly = next(s for s in out["scored"] if s["profile"])
+    assert kelly["eligible"] is False  # degenerate zero-exposure rejected
+    assert out["chosen"] is None
+
+
+def test_calmar_objective_uses_proxy_not_silent_sharpe():
+    """objective='calmar' with no calmar_ratio surfaced must score by return/|dd|,
+    not silently by Sharpe."""
+    m = {"sharpe_ratio": 1.5, "total_return_pct": 0.6, "max_drawdown_pct": 0.30}
+    assert sel.objective_score(m, "calmar") == pytest.approx(0.6 / 0.30)
+
+
 # ── gauntlet persistence ────────────────────────────────────────────────────
 
 def _insert_strategy(db_path, sid, params):

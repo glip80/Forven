@@ -1728,10 +1728,16 @@ def _enrich_scan_frame(df: pd.DataFrame, asset: str, timeframe: str) -> pd.DataF
 # ─── Technical Indicators ─────────────────────────────────────────────────────
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """RSI using pandas rolling."""
+    """Wilder's RSI (RMA-smoothed average gain/loss).
+
+    Matches TradingView/Binance `ta.rsi` and the canonical `indicators._rsi`, so the
+    scanner's builtin RSI strategies fire on the SAME bars as the chart and backtest.
+    (Was an SMA basis / Cutler's RSI, which drifted the triggers.)
+    """
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    n = max(int(period), 1)
+    gain = delta.clip(lower=0).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
     rs = gain / loss.clip(lower=1e-9)
     return 100 - (100 / (1 + rs))
 
@@ -2234,7 +2240,7 @@ def check_bb_signal(df: pd.DataFrame, p: dict) -> dict:
     d = df.copy()
     bp = p.get("bb_period", 20)
     d["bb_mid"] = d["close"].rolling(bp).mean()
-    d["bb_std"] = d["close"].rolling(bp).std()
+    d["bb_std"] = d["close"].rolling(bp).std(ddof=0)  # population std (TradingView parity)
     d["bb_upper"] = d["bb_mid"] + p.get("bb_std", 2.0) * d["bb_std"]
     d["adx_val"] = adx(d, p.get("adx_period", 14))
     d["atr_14"] = atr(d, 14)
@@ -2267,7 +2273,7 @@ def check_bb_reversion_signal(df: pd.DataFrame, p: dict) -> dict:
     bp = int(p.get("bb_period", 20))
     std_mult = float(p.get("bb_std", 2.0))
     d["bb_mid"] = d["close"].rolling(bp).mean()
-    d["bb_std"] = d["close"].rolling(bp).std()
+    d["bb_std"] = d["close"].rolling(bp).std(ddof=0)  # population std (TradingView parity)
     d["bb_upper"] = d["bb_mid"] + std_mult * d["bb_std"]
     d["bb_lower"] = d["bb_mid"] - std_mult * d["bb_std"]
     d["rsi"] = rsi(d["close"], int(p.get("rsi_period", 14)))
@@ -2794,7 +2800,7 @@ def check_orb_signal(df: pd.DataFrame, p: dict) -> dict:
     p = p or {}
     range_bars = int(p.get("range_bars", 4))
     risk_pct = float(p.get("risk_pct", 0.01))
-    leverage = float(p.get("leverage", 3.0))
+    leverage = float(p.get("leverage", 1.0) or 1.0)  # match the unified default (was 3x)
 
     df = df.copy()
     price_fallback = float(df["close"].iloc[-1]) if not df.empty else 0.0
@@ -4404,10 +4410,17 @@ def manage_positions(
                 _coerce_positive_float((p.get("execution_profile") or {}).get("initial_capital"))
                 or _PAPER_SANDBOX_INITIAL_CAPITAL
             )
-            _leverage = float(p.get("leverage", 1.0) or 1.0)
-            # Stop distance (fraction of price): profile stop → derived signal stop
-            # → ATR×1.5 → 3% floor, mirroring the backtest's stop-distance basis.
-            _stop_dist_pct = _sizing.entry_stop_dist_pct(_controls, entry_price=float(price), atr_value=atr_14)
+            from forven.strategies.backtest import resolve_leverage as _resolve_leverage
+            _leverage = _resolve_leverage(p)
+            # SIZING stop distance = EXACTLY what the kernel/backtest feed to
+            # size_fraction (None for a fraction profile with no stop). Passing an
+            # invented stop here would make fraction-mode size_fraction =
+            # risk_per_trade/(stop·lev) instead of the flat risk_per_trade the backtest
+            # deploys — a ~33x oversize. So sizing reads the None-aware value …
+            _sizing_stop_dist = _sizing.entry_stop_dist_pct(_controls, entry_price=float(price), atr_value=atr_14)
+            # … and the PROTECTIVE exchange stop falls back to a signal/ATR/3% distance
+            # independently (it never feeds sizing).
+            _stop_dist_pct = _sizing_stop_dist
             if _stop_dist_pct is None:
                 if stop_loss is not None and price:
                     _stop_dist_pct = abs(float(price) - float(stop_loss)) / float(price)
@@ -4419,7 +4432,7 @@ def manage_positions(
                 _recent_strategy_returns(strat_id) if _controls.get("sizing_mode") == "kelly" else None
             )
             _size_fraction = _sizing.size_fraction(
-                _controls, _stop_dist_pct, leverage=_leverage,
+                _controls, _sizing_stop_dist, leverage=_leverage,
                 initial_capital=_profile_initial_capital, closed_gross=_closed_gross,
             )
             size = round(
@@ -5128,15 +5141,28 @@ def _is_kernel_paper_strategy(strat: dict) -> bool:
 
 
 def _resolve_kernel_trade_mode(strat: dict, strategy_instance) -> str:
-    tm = str((strat.get("params") or {}).get("trade_mode") or strat.get("trade_mode") or "").strip().lower()
-    if tm in ("long_only", "short_only", "both"):
-        return tm
-    modes = getattr(strategy_instance, "supported_trade_modes", None)
-    if modes and "both" in modes:
-        return "both"
-    if modes and modes == {"short_only"}:
-        return "short_only"
-    return "long_only"
+    """Resolve the kernel's trade_mode via the SHARED backtest resolver so paper runs
+    the same side(s) the confirmation backtest validated.
+
+    Honors an explicit params/strat-level trade_mode, otherwise defers to the shared
+    default + supported-modes logic. The previous bespoke logic defaulted a both-capable
+    strategy to 'both', diverging from the backtest (which defaults via params) — so paper
+    could trade a side the strategy was never promoted on.
+    """
+    from forven.strategies import backtest as _bt
+
+    p = strat.get("params") or {}
+    requested = str(p.get("trade_mode") or strat.get("trade_mode") or "").strip() or None
+    strategy_type = str(strat.get("runtime_type") or strat.get("type") or "").strip() or None
+    mode, err = _bt.resolve_backtest_trade_mode(
+        requested, strategy_type=strategy_type, params=p, strategy_obj=strategy_instance,
+    )
+    if err:
+        # Requested mode unsupported by the strategy → fall back to its natural mode.
+        mode, _ = _bt.resolve_backtest_trade_mode(
+            None, strategy_type=strategy_type, params=p, strategy_obj=strategy_instance,
+        )
+    return mode
 
 
 def _kernel_recorded_trades(strat_id: str) -> list[dict]:
@@ -5517,19 +5543,30 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     if strategy_instance is None:
         return _skip("could not resolve strategy instance")
 
-    leverage = float(p.get("leverage", 1.0) or 1.0)
-    _, fee_bps, slippage_bps = _resolve_trade_assumptions(p)
+    # Resolve via the shared engine default so the kernel paper run matches the
+    # confirmation backtest's leverage (operator default_leverage when undeclared).
+    leverage = _bt.resolve_leverage(p)
+    # Source fees/slippage from the SAME backtest settings the confirmation backtest
+    # uses (not risk_fee_bps), so the kernel's round_trip_drag — and therefore net
+    # pnl_pct — matches the validated backtest exactly.
+    fee_bps = max(_scanner_float_setting("backtest_fee_bps", 4.5), 0.0)
+    slippage_bps = max(_scanner_float_setting("backtest_slippage_bps", 2.0), 0.0)
     ec = _bt.execution_controls_from_params(p) or None
-    initial_capital = (
-        _coerce_positive_float((p.get("execution_profile") or {}).get("initial_capital"))
-        or _PAPER_SANDBOX_INITIAL_CAPITAL
-    )
+    # Sizing initial_capital MUST equal the confirmation backtest's (10k, since its
+    # body.initial_capital is None). Reading execution_profile.initial_capital here
+    # would diverge 'fixed'-mode sizing from the validated backtest.
+    initial_capital = _PAPER_SANDBOX_INITIAL_CAPITAL
     trade_mode = _resolve_kernel_trade_mode(strat, strategy_instance)
     strategy_type = str(strat.get("runtime_type") or strat.get("type") or "").strip() or None
 
+    # The kernel's simulate() skips the first KERNEL_WARMUP+1 bars, so the EARLIEST
+    # entry it can reproduce is df.index[KERNEL_WARMUP+1]. The orphan-close guard below
+    # must use that as window_start — using df.index[0] would treat a still-valid open
+    # whose entry fell in the warmup band as an orphan and converge-close it.
+    KERNEL_WARMUP = 200
     try:
         res = _bt.run_strategy_execution(
-            df, strategy_instance, params=p, warmup=200, leverage=leverage,
+            df, strategy_instance, params=p, warmup=KERNEL_WARMUP, leverage=leverage,
             fee_bps=fee_bps, slippage_bps=slippage_bps, regime_gate=False,
             trade_mode=trade_mode, execution_controls=ec, initial_capital=initial_capital,
             strategy_type=strategy_type,
@@ -5559,7 +5596,10 @@ def manage_positions_via_kernel(strat_id: str, strat: dict, *, account_equity=No
     # triggers, not recorded trades. Closes/refreshes of recorded trades are unaffected.
     _backfill_bars = min(_paper_kernel_backfill_bars(), len(df))
     recent_cutoff = str(df.index[-_backfill_bars]) if len(df) >= 2 else None
-    window_start = str(df.index[0]) if len(df) else None
+    # Anchor the orphan-close guard to the FIRST bar the kernel can actually replay
+    # (df.index[KERNEL_WARMUP+1]), not df.index[0]; otherwise a long-held open whose
+    # entry predates the kernel's tradable window is unreproducible and wrongly orphaned.
+    window_start = str(df.index[min(KERNEL_WARMUP + 1, len(df) - 1)]) if len(df) else None
     last_close = float(df["close"].iloc[-1]) if len(df) else 0.0
     last_time = str(df.index[-1]) if len(df) else ""
     actions_plan = reconcile(

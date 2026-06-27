@@ -155,6 +155,10 @@ DEFAULT_PIPELINE_CONFIG = {
         "param_jitter_deadline_seconds": 240,  # wall-clock safety net; 0 disables
         "cost_stress_min_sharpe": 0.3,
         "regime_split_profitable_min": 0.50,
+        # Minimum trades a regime must hold to COUNT toward the regime-split diversity
+        # verdict. A 1-trade regime is statistically meaningless and must not satisfy the
+        # ≥2-regime gate or dilute the profitable-share. Plain integer.
+        "regime_split_min_trades_per_regime": 5,
         # DEPRECATED: the gauntlet gate now reads wfa_fold_pass_rate_min (below) as
         # the single fold-pass-rate floor. Retained only for back-compat with any
         # persisted KV payloads; no longer consulted by _evaluate_gauntlet_gate.
@@ -246,7 +250,11 @@ DEFAULT_PIPELINE_CONFIG = {
 PIPELINE_PRESETS = {
     "default": {},
     "relaxed": {
-        "quick_screen": {"min_trades": 5, "min_robustness_score": 0, "min_profit_factor": 1.0},
+        # min_is_sharpe MUST be listed even at 0.0: presets are re-applied as deltas over
+        # a fully-materialized stored config, so omitting it would let a prior preset's
+        # value (strict sets 0.2) survive a strict→relaxed switch, leaving "relaxed"
+        # stricter than default on the IS-Sharpe axis.
+        "quick_screen": {"min_trades": 5, "min_robustness_score": 0, "min_profit_factor": 1.0, "min_is_sharpe": 0.0},
         "gauntlet": {
             "min_trades": 5,
             "min_sharpe": 0.0,
@@ -332,6 +340,11 @@ _RATIO_THRESHOLD_PATHS = (
     # may enter 40 / 0.40 (or 60 / 0.60) interchangeably for the gauntlet->paper gate.
     ("gauntlet", "mc_max_dd_p95"),
     ("robustness_thresholds", "param_jitter_pass_rate_min"),
+    # Same fraction-in-[0,1] shape and same %-habit risk as the rails above: a
+    # percent-style entry (65 / 50) would otherwise be compared against a 0–1 measurement
+    # and silently break the Monte-Carlo / regime-split gates.
+    ("robustness_thresholds", "monte_carlo_percentile_min"),
+    ("robustness_thresholds", "regime_split_profitable_min"),
     # safety_floors ratio rails — accept percent (40) or fraction (0.40) like the gate
     # twins above, so a percent-habit entry can't store a raw 40 and silently no-op a
     # rail (incl. the real-money live_max_drawdown_pct ceiling).
@@ -701,11 +714,16 @@ def _normalize_pipeline_stage(value: str | None) -> str:
     return normalize_stage(value)
 
 
-def _to_percent_points(value: object, default: float = 0.0) -> float:
+def _to_percent_points(value: object, default: float = 0.0, *, always_scale: bool = False) -> float:
     try:
         parsed = float(value)
     except Exception:
         parsed = float(default)
+    if always_scale:
+        # The input is a known RATIO (e.g. total_return_pct = equity-1.0), which can
+        # exceed 1.0 for a >100% return; the |x|<=1 heuristic would under-scale it
+        # (a 1.5 ratio = +150% would be read as 1.5%). Scale unconditionally.
+        return parsed * 100.0
     if abs(parsed) <= 1.0:
         return parsed * 100.0
     return parsed
@@ -3043,10 +3061,18 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     if has_distinct_oos and sharpe_gap > 1.5:
         return False, f"S00552 REJECT: IS/OOS Sharpe gap {sharpe_gap:.2f} exceeds 1.5 limit (gauntlet entry blocked)"
     
-    # === S00552 GUARDRAIL 2: Pre-Gauntlet Robustness Gate (≥ 25/100) ===
+    # === S00552 GUARDRAIL 2: Pre-Gauntlet Robustness Gate (editable) ===
+    # Read the wired quick_screen.min_robustness_score knob (default 0 — the composite
+    # robustness is EARNED inside the gauntlet, so a non-zero quick-screen floor is a
+    # catch-22; strict raises it to 40). The old hardcoded 10 ignored the knob and
+    # contradicted the documented default, so relaxed/strict couldn't tune this axis.
     robustness = _resolve_robustness_points(metrics)
-    if robustness < 10.0:
-        return False, f"S00552 REJECT: Robustness {robustness:.1f}/100 below 10 minimum (pre-gauntlet gate failed)"
+    min_qs_robustness = float(gate.get("min_robustness_score", _qs_defaults.get("min_robustness_score", 0.0)) or 0.0)
+    if robustness < min_qs_robustness:
+        return False, (
+            f"S00552 REJECT: Robustness {robustness:.1f}/100 below {min_qs_robustness:.0f} "
+            "minimum (pre-gauntlet gate failed)"
+        )
     
     # === S00552 GUARDRAIL 3: Profit Factor Floor at BOTH IS and OOS ===
     # M-15 (2026-06-09 audit): honor the wired quick_screen.min_profit_factor
@@ -3090,7 +3116,7 @@ def _evaluate_quick_screen_gate(strategy_id: str, config: dict) -> tuple[bool, s
     if isinstance(oos_metrics, dict) and oos_metrics:
         target_metrics.update({k: v for k, v in oos_metrics.items() if v is not None})
 
-    total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", 0.0))
+    total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", 0.0), always_scale=True)
     max_dd = _to_ratio(target_metrics.get("max_drawdown_pct", 1.0), 1.0)
     sharpe = float(target_metrics.get("sharpe", 0.0) or 0.0)
 
@@ -3367,7 +3393,9 @@ def _evaluate_gauntlet_gate(strategy_id: str, config: dict) -> tuple[bool, str]:
     has_win_rate = target_metrics.get("win_rate") is not None
 
     if has_total_return:
-        total_return_pct = _to_percent_points(target_metrics.get("total_return_pct", target_metrics.get("total_return", 0.0)))
+        total_return_pct = _to_percent_points(
+            target_metrics.get("total_return_pct", target_metrics.get("total_return", 0.0)), always_scale=True
+        )
         if total_return_pct < min_return:
             return False, f"Gauntlet return too low: {total_return_pct:.2f}% (minimum {min_return:.2f}%)"
     if has_max_dd:

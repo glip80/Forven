@@ -117,20 +117,26 @@ def objective_score(metrics: dict, objective: str | None = DEFAULT_OBJECTIVE) ->
     sortino = _metric(metrics, "sortino_ratio", "sortino")
     calmar = _metric(metrics, "calmar_ratio", "calmar")
     ret = _metric(metrics, "total_return", "total_return_pct")
-    dd = _metric(metrics, "max_drawdown", "max_dd", "maximum_drawdown")
+    # The kernel reports drawdown as the fraction ``max_drawdown_pct`` (read it FIRST
+    # so the calmar proxy and the selection DD guard actually see a value).
+    dd = _metric(metrics, "max_drawdown_pct", "max_drawdown", "max_dd", "maximum_drawdown")
+    calmar_proxy = (ret / abs(dd)) if (ret is not None and dd not in (None, 0.0)) else None
 
     if obj in ("sortino", "sortino_ratio") and sortino is not None:
         return sortino
-    if obj in ("calmar", "calmar_ratio") and calmar is not None:
-        return calmar
+    if obj in ("calmar", "calmar_ratio"):
+        # calmar_ratio is not surfaced by the backtest today; fall back to the
+        # return/|drawdown| proxy rather than silently scoring by Sharpe.
+        if calmar is not None:
+            return calmar
+        if calmar_proxy is not None:
+            return calmar_proxy
     if obj in ("sharpe", "sharpe_ratio") and sharpe is not None:
         return sharpe
     for val in (sharpe, sortino, calmar):
         if val is not None and math.isfinite(val):
             return val
-    if ret is not None and dd not in (None, 0.0):
-        return ret / abs(dd)
-    return ret
+    return calmar_proxy if calmar_proxy is not None else ret
 
 
 def _resolve_bars(timeframe: str, bars: int | None) -> int:
@@ -189,7 +195,9 @@ def _run_candidate(
         "score": objective_score(metrics, None),  # filled by caller's objective below
         "sharpe": _metric(metrics, "sharpe_ratio", "sharpe"),
         "total_return": _metric(metrics, "total_return", "total_return_pct"),
-        "max_drawdown": _metric(metrics, "max_drawdown", "max_dd", "maximum_drawdown"),
+        # The kernel emits the drawdown FRACTION under ``max_drawdown_pct`` — read that
+        # primary key so the selection's drawdown guard is not a no-op.
+        "max_drawdown": _metric(metrics, "max_drawdown_pct", "max_drawdown", "max_dd", "maximum_drawdown"),
         "trades": _metric(metrics, "total_trades", "num_trades", "trade_count", default=0),
         "metrics": metrics,
     }
@@ -229,7 +237,12 @@ def select_execution_profile(
     tf = str(timeframe or "1h").strip().lower() or "1h"
     resolved_bars = _resolve_bars(tf, bars)
     if leverage is None:
-        leverage = _coerce(params.get("leverage"), 1.0) if isinstance(params, dict) else 1.0
+        # Resolve via the shared engine default (strategy's declared leverage, else the
+        # operator default_leverage) so selection sizes leverage-sensitive profiles
+        # exactly as the confirmation backtest and paper will.
+        from forven.strategies.backtest import resolve_leverage as _resolve_leverage
+
+        leverage = _resolve_leverage(params if isinstance(params, dict) else {})
     grid = candidates if candidates is not None else candidate_profiles(max_risk=max_risk, lean=lean)
 
     scored: list[dict] = []
@@ -256,14 +269,32 @@ def select_execution_profile(
         res["is_default"] = profile is None
         dd = res.get("max_drawdown")
         trades = res.get("trades") or 0
-        res["eligible"] = (trades >= min_trades) and (dd is None or dd <= max_dd) and (res["score"] is not None)
+        ret = res.get("total_return")
+        # A degenerate candidate that deploys ~zero size (e.g. kelly with no win/loss
+        # evidence yet) posts score 0.0 and exactly-zero return; it must never be able
+        # to win a sweep over real-sizing candidates.
+        degenerate = (res.get("score") in (None, 0.0)) and (ret in (None, 0.0))
+        res["eligible"] = (
+            (trades >= min_trades)
+            and (dd is not None and dd <= max_dd)  # fail closed: unknown/excessive DD is NOT eligible
+            and (res["score"] is not None)
+            and not degenerate
+        )
         if profile is None:
             baseline = res
         scored.append(res)
 
-    # Prefer eligible candidates; fall back to min-trade-passing, then anything scored.
+    # Prefer eligible candidates. If NONE clear the drawdown/min-trade guard, keep the
+    # conservative DEFAULT engine (chosen=None) rather than freezing an ineligible
+    # (e.g. excessive-drawdown) winner; only if there is no usable default do we fall
+    # back to min-trade-passing / anything scored.
     eligible = [s for s in scored if s.get("eligible")]
-    pool = eligible or [s for s in scored if (s.get("trades") or 0) >= min_trades] or scored
+    if eligible:
+        pool = eligible
+    elif baseline is not None and baseline.get("score") is not None:
+        pool = [baseline]
+    else:
+        pool = [s for s in scored if (s.get("trades") or 0) >= min_trades] or scored
     pool = [s for s in pool if s.get("score") is not None]
     best = max(pool, key=lambda s: s["score"]) if pool else None
 

@@ -124,6 +124,9 @@ def finalize(
         "trade_mode": trade_mode,
         "position_model": "hedged" if trade_mode == "both" else "single_side",
         "size_fraction": round(size_fraction, 4),
+        # Full-precision fraction (the display field above is rounded to 4dp); the
+        # post-hoc funding pass reads this so its leg is scaled identically to price PnL.
+        "size_fraction_raw": size_fraction,
         "exit_reason": exit_reason,
     }
     if open_at_end:
@@ -199,6 +202,15 @@ def simulate(
             if ec["time_stop_bars"] and (idx - int(at["entry_bar"])) >= ec["time_stop_bars"]:
                 exit_price, exit_reason = fill_price, "time_stop"
 
+            # Signal-driven exit (decided at the prior bar's close → a market-on-open
+            # order that fills at THIS bar's open). Because the open is the first tick of
+            # the bar, it must pre-empt any intrabar stop/take-profit that would only
+            # trigger later within the same bar — evaluated here, before the stop/TP.
+            if exit_price is None:
+                exit_series = signals.long_exits if direction == "long" else signals.short_exits
+                if bool(exit_series.iloc[signal_idx]):
+                    exit_price, exit_reason = fill_price, "signal"
+
             # Combine fixed stop and trailing stop into the tighter effective level.
             # The trailing level uses the peak through the PRIOR bar (at["extreme"]);
             # this bar's new high/low is folded in only AFTER the breach check (below),
@@ -236,23 +248,16 @@ def simulate(
                 # Still open — ratchet the trailing peak with THIS bar for the next bar.
                 at["extreme"] = max(at["extreme"], bar_high) if direction == "long" else min(at["extreme"], bar_low)
 
-        # (2) Signal-driven exits (fill at this bar's open).
-        for direction in allowed_modes:
-            exit_series = signals.long_exits if direction == "long" else signals.short_exits
-            at = active_trades.get(direction)
-            if at is None or not bool(exit_series.iloc[signal_idx]):
-                continue
-            finalize(trades, closed_gross, at, direction, fill_price, idx, current_time, "signal",
-                     round_trip_drag=round_trip_drag, leverage=leverage, trade_mode=trade_mode)
-            active_trades[direction] = None
-
-        # (3) Signal-driven entries (fill at this bar's open).
+        # (2) Signal-driven entries (fill at this bar's open).
         for direction in allowed_modes:
             entry_series = signals.long_entries if direction == "long" else signals.short_entries
             if active_trades.get(direction) is not None or not bool(entry_series.iloc[signal_idx]):
                 continue
             sign = _trade_direction_sign(direction)
-            stop_dist_pct = _entry_stop_dist_pct(idx, fill_price)
+            # Size/stop off the ATR through the LAST CLOSED bar (signal_idx = idx-1).
+            # Using atr_vals[idx] would read the entry bar's own (not-yet-realized)
+            # high/low/close at the open where the fill happens — a forward-looking read.
+            stop_dist_pct = _entry_stop_dist_pct(signal_idx, fill_price)
             stop_price = None
             if stop_dist_pct is not None and (ec["stop_loss_pct"] is not None or ec["sizing_mode"] == "atr"):
                 stop_price = fill_price * (1.0 - sign * stop_dist_pct)

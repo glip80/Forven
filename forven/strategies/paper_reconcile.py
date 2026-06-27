@@ -66,8 +66,27 @@ class ReconcileAction:
     recorded: dict | None = None
 
 
+def _canonical_ts(entry_time: str) -> str:
+    """Canonicalize a timestamp string for keying — tolerant of the same format drift
+    (space vs 'T', tz present/absent) that ``_ts_lt`` handles, so a recorded OPEN and
+    its kernel-finalized close still match when the candle index dtype/tz representation
+    shifts between scans. Falls back to the raw string when parsing fails."""
+    from datetime import datetime, timezone
+
+    s = str(entry_time or "").strip().replace(" ", "T")
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return str(entry_time)
+
+
 def _key(direction: str, entry_time: str) -> tuple[str, str]:
-    return (str(direction or "long").strip().lower(), str(entry_time))
+    return (str(direction or "long").strip().lower(), _canonical_ts(entry_time))
 
 
 def reconcile(res: KernelResult, recorded: list[dict], *, recent_cutoff: str | None = None, window_start: str | None = None) -> list[ReconcileAction]:

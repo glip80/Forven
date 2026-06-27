@@ -318,6 +318,20 @@ def partial_close_paper_position(session_id: str, qty=None, pct=None) -> dict:
     size = abs(_coerce_optional_float(trade.get("size")) or 0.0)
     if size <= 0:
         raise HTTPException(status_code=400, detail="Position has no size to close.")
+    # A kernel-managed position is modeled by the execution kernel at its FULL original
+    # size; the reconciler has no knowledge of a manual partial, so it would later
+    # re-close the whole parent — double-counting the units booked here. Refuse unless
+    # the operator has paused (detached) management first.
+    _sd = parse_trade_signal_data(trade.get("signal_data"))
+    if bool(_sd.get("kernel_managed")) and not bool(_sd.get("manual_pause")):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot partial-close a strategy-managed position: the execution kernel "
+                "would re-close the full original size and double-count. Pause management "
+                "for this strategy first, then partial-close."
+            ),
+        )
     close_qty = _resolve_close_qty(qty, pct, size)
     if close_qty >= size:
         return close_paper_position(session_id, reason="manual_partial_close (full)")

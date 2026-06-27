@@ -1692,6 +1692,11 @@ _DEFAULT_SETTINGS_PAYLOAD = {
     "alert_on_degradation_pct": 20,
     "backtest_fee_bps": 4.5,
     "backtest_slippage_bps": 2.0,
+    # Fallback leverage when a strategy declares no `leverage` param. ONE default
+    # shared by the gauntlet confirmation/robustness backtests, the execution-profile
+    # selection, and the live/paper scanner so leverage-sensitive sizing matches
+    # (the parity invariant). 1x = unlevered; operator-editable.
+    "default_leverage": 1.0,
     "backtest_timeframe": "1h",
     "backtest_symbol": "BTC/USDT",
     # DEFAULT backtest window (calendar days, ending now). Used directly by ad-hoc /
@@ -2870,6 +2875,9 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
             updates["backtest_fee_bps"] = _coerce_float(payload.get("backtest_fee_bps"), updates.get("backtest_fee_bps", 4.5))
         if "backtest_slippage_bps" in payload:
             updates["backtest_slippage_bps"] = _coerce_float(payload.get("backtest_slippage_bps"), updates.get("backtest_slippage_bps", 2.0))
+        if "default_leverage" in payload:
+            _lev = _coerce_float(payload.get("default_leverage"), updates.get("default_leverage", 1.0))
+            updates["default_leverage"] = float(_lev) if (_lev is not None and _lev > 0) else 1.0
         if "backtest_timeframe" in payload:
             updates["backtest_timeframe"] = str(payload.get("backtest_timeframe") or "1h").strip()
         if "backtest_symbol" in payload:
@@ -10439,7 +10447,9 @@ def _is_canonical_backtest_submit(
     if str(body.trade_mode or "").strip() or body.allow_shorting is not None:
         return False
     if body.leverage is not None:
-        stored_leverage = _coerce_float(execution_params.get("leverage"), 3.0) or 3.0
+        stored_leverage = _coerce_float(execution_params.get("leverage"), None)
+        if stored_leverage is None or stored_leverage <= 0:
+            stored_leverage = float(settings.get("default_leverage", 1.0) or 1.0)
         if abs(float(body.leverage) - float(stored_leverage)) > 1e-9:
             return False
 
@@ -10556,8 +10566,11 @@ def post_backtest_submit(body: BacktestSubmitBody, *, skip_auto_trash: bool = Fa
 
     leverage_value = _coerce_float(body.leverage, None)
     if leverage_value is None:
-        leverage_value = _coerce_float(execution_params.get("leverage"), 3.0)
-    leverage_value = float(leverage_value or 3.0)
+        leverage_value = _coerce_float(execution_params.get("leverage"), None)
+    if leverage_value is None or leverage_value <= 0:
+        # Operator-configurable default (1x) shared with paper/selection for parity.
+        leverage_value = float(get_settings().get("default_leverage", 1.0) or 1.0)
+    leverage_value = float(leverage_value)
 
     settings = get_settings()
     default_backtest_timeframe = str(settings.get("backtest_timeframe") or "1h").strip() or "1h"

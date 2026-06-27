@@ -210,6 +210,10 @@ def _metric(metrics: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 def _quick_screen_failures(metrics: dict[str, Any], cfg: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     total_return = _metric(metrics, "total_return_pct", "total_return", default=0.0)
+    # total_return_pct is stored as a RATIO (0.12 == 12%) while min_total_return_pct is
+    # in percent POINTS — convert before comparing (the authoritative gauntlet gate does
+    # the same); otherwise a 0.0–1.0 ratio is compared to e.g. a 5.0 threshold.
+    total_return_pp = total_return * 100.0
     sharpe = _metric(metrics, "sharpe_ratio", "sharpe", default=0.0)
     max_dd = _ratio(metrics.get("max_drawdown_pct", metrics.get("max_drawdown")), 0.0)
     win_rate = _ratio(metrics.get("win_rate"), 0.0)
@@ -221,8 +225,8 @@ def _quick_screen_failures(metrics: dict[str, Any], cfg: dict[str, Any]) -> list
     min_win_rate = _ratio(cfg.get("min_win_rate"), 0.0)
     min_profit_factor = _as_float(cfg.get("min_profit_factor"), 0.0)
 
-    if total_return < min_total_return:
-        failures.append(f"total_return_pct {total_return:.2f} < {min_total_return:.2f}")
+    if total_return_pp < min_total_return:
+        failures.append(f"total_return_pct {total_return_pp:.2f}% < {min_total_return:.2f}%")
     if sharpe < min_sharpe:
         failures.append(f"sharpe {sharpe:.2f} < {min_sharpe:.2f}")
     if max_dd > max_drawdown:
@@ -1139,6 +1143,14 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
     and promotion proceeds on the safe shared default (1% risk / 2x-ATR). This is
     the chokepoint that makes "paper adheres to the chosen engine" true: every
     strategy passes through the promotion gate before it is param-locked in paper.
+
+    Ordering note: selection runs at the END of the gate, AFTER the robustness battery
+    (WFA/MC/jitter/cost-stress). Those legs validate the strategy's SIGNAL generalization
+    — entry/exit timing, which is sizing-agnostic (the chosen profile changes position
+    SIZE and stop distance, not which bars fire). The chosen profile's risk-adjusted edge
+    is screened here (Sharpe + max-DD + min-trades over the confirmation window), and its
+    real out-of-sample validation is the PAPER forward-test it then enters. (A future
+    hardening could re-run WFA on the frozen profile before transitioning; tracked.)
     """
     if not _execution_profile_selection_enabled():
         return {"skipped": True, "reason": "disabled by setting"}
@@ -1155,6 +1167,15 @@ def _select_and_persist_execution_profile(workflow: dict[str, Any], strategy_id:
         params = {}
     if isinstance(params.get("execution_profile"), dict) and params["execution_profile"]:
         return {"skipped": True, "reason": "execution_profile already present"}
+    # Idempotency must also cover the case where the DEFAULT engine wins (chosen=None):
+    # no execution_profile is written then, so guarding only on params would re-run the
+    # full ~15-20-backtest sweep on EVERY gate retry (e.g. while waiting for a paper
+    # capital slot). The selection always records a marker, so honor that too.
+    _existing_metrics = _loads(row.get("metrics"), {})
+    if isinstance(_existing_metrics, dict) and isinstance(
+        _existing_metrics.get("gauntlet_selected_execution_profile"), dict
+    ):
+        return {"skipped": True, "reason": "execution profile already selected"}
 
     selection = select_execution_profile(
         strategy_id=strategy_id,

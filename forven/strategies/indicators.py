@@ -157,8 +157,11 @@ def _atr_wilder(df: pd.DataFrame, n: int) -> pd.Series:
 
 def _rsi(close: pd.Series, n: int) -> pd.Series:
     delta = close.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(n).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(n).mean()
+    # Wilder's RSI: the average gain/loss are Wilder-smoothed (RMA), NOT a simple
+    # moving average. This matches TradingView/Binance `ta.rsi`; an SMA basis
+    # (Cutler's RSI) drifts the trigger bars away from what users see on the chart.
+    gain = _rma(delta.where(delta > 0, 0.0), n)
+    loss = _rma(-delta.where(delta < 0, 0.0), n)
     rs = gain / loss.clip(lower=1e-9)
     return 100 - (100 / (1 + rs))
 
@@ -262,7 +265,8 @@ def _f_natr(df, p, i):
 
 
 def _f_stddev(df, p, i):
-    return {i: _c(df).rolling(p["length"]).std()}
+    # Population std (ddof=0) to match TradingView `ta.stdev`.
+    return {i: _c(df).rolling(p["length"]).std(ddof=0)}
 
 
 def _f_hvol(df, p, i):
@@ -274,7 +278,9 @@ def _f_bollinger(df, p, i):
     close = _c(df)
     n, k = p["length"], p["num_std"]
     mid = close.rolling(n).mean()
-    sd = close.rolling(n).std()
+    # Population std (ddof=0): standard Bollinger Bands / TradingView `ta.stdev`.
+    # pandas' default ddof=1 makes the bands systematically too wide.
+    sd = close.rolling(n).std(ddof=0)
     return {i: mid, f"{i}_mid": mid, f"{i}_upper": mid + k * sd, f"{i}_lower": mid - k * sd}
 
 
@@ -282,7 +288,7 @@ def _f_bbwidth(df, p, i):
     close = _c(df)
     n, k = p["length"], p["num_std"]
     mid = close.rolling(n).mean()
-    sd = close.rolling(n).std()
+    sd = close.rolling(n).std(ddof=0)  # population std, matching _f_bollinger / TradingView
     return {i: _safe_div(2 * k * sd, mid) * 100.0}
 
 
@@ -558,6 +564,13 @@ def _f_vwap(df, p, i):
     if length > 0:
         num = (tp * vol).rolling(length).sum()
         den = vol.replace(0, np.nan).rolling(length).sum()
+    elif isinstance(df.index, pd.DatetimeIndex):
+        # Anchored VWAP resets each UTC day (an intraday VWAP), not a running
+        # cumulative-since-start-of-data number that drifts further from price the
+        # longer the loaded window.
+        day = df.index.normalize()
+        num = (tp * vol).groupby(day).cumsum()
+        den = vol.replace(0, np.nan).groupby(day).cumsum()
     else:
         num = (tp * vol).cumsum()
         den = vol.replace(0, np.nan).cumsum()
@@ -589,7 +602,9 @@ def _f_mfi(df, p, i):
     delta = tp.diff()
     pos = rmf.where(delta > 0, 0.0).rolling(n).sum()
     neg = rmf.where(delta < 0, 0.0).rolling(n).sum()
-    mfr = _safe_div(pos, neg)
+    # Clamp the denominator (like RSI) so an all-up window (neg == 0) yields MFI≈100,
+    # not NaN (_safe_div would null the 0 denominator).
+    mfr = pos / neg.clip(lower=1e-9)
     return {i: 100 - 100 / (1 + mfr)}
 
 

@@ -784,11 +784,24 @@ def _execute_gauntlet_step(
 
         from forven.strategies.optimization_acceptance import apply_optimized_params_if_accepted
 
+        # Merge the swept overrides over the CURRENT params (preferring the optimizer's
+        # merged best_full_params). Writing the overrides ALONE would wipe every
+        # non-swept param from the strategy — the gauntlet apply path merges
+        # ({**current, **best}); mirror it so evaluation and the write use the same
+        # full param set.
+        current_params = params if isinstance(params, dict) else {}
+        full_params = None
+        for payload in (config_payload, metrics_payload):
+            if isinstance(payload, dict) and isinstance(payload.get("best_full_params"), dict) and payload["best_full_params"]:
+                full_params = dict(payload["best_full_params"])
+                break
+        new_params = {**current_params, **(full_params or best_params)}
+
         def _write_best_params(decision):
             with get_db() as conn:
                 conn.execute(
                     "UPDATE strategies SET params = ?, updated_at = ? WHERE id = ?",
-                    (json.dumps(best_params), datetime.now(timezone.utc).isoformat(), strategy_id),
+                    (json.dumps(new_params), datetime.now(timezone.utc).isoformat(), strategy_id),
                 )
             append_strategy_event(
                 strategy_id=strategy_id,
@@ -796,15 +809,15 @@ def _execute_gauntlet_step(
                 to_state=from_state,
                 actor="system",
                 reason="Applied optimized params (passed out-of-sample acceptance gate)",
-                details={"params": best_params, "motion": "params_applied", "acceptance": decision.as_record()},
+                details={"params": new_params, "motion": "params_applied", "acceptance": decision.as_record()},
             )
 
         outcome = apply_optimized_params_if_accepted(
             strategy_id=strategy_id,
             asset=symbol,
             strategy_type=strategy_type,
-            current_params=params if isinstance(params, dict) else {},
-            candidate_params=best_params,
+            current_params=current_params,
+            candidate_params=new_params,
             write_fn=_write_best_params,
             optimization_metrics=optimization_metrics,
             from_state=from_state,

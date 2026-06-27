@@ -71,6 +71,8 @@ def optimize_one(strat: dict, *, objective: str, max_risk: float, max_dd: float,
         max_dd=max_dd,
         min_trades=min_trades,
         regime_gate=False,  # match the paper scanner's kernel call (the parity reference)
+        lean=True,  # use the SAME lean candidate grid the gauntlet promotion selection uses
+                    # (~15 candidates vs ~30) — faster AND matches what a re-gauntlet picks.
     )
     return {
         "id": strat["id"], "name": strat.get("name"), "type": strat.get("type"),
@@ -161,7 +163,7 @@ def main(argv=None) -> int:
           f"[objective={args.objective}, engines=fraction/atr/kelly/full, max_risk={args.max_risk:.0%}, max_dd={args.max_dd:.0%}]")
     if skipped_existing:
         print(f"  ({len(skipped_existing)} already carry a profile — skipped; use --force to re-select)")
-    print(f"Grid: {len(candidate_profiles(max_risk=args.max_risk))} candidates/strategy via the shared kernel. This takes a while.\n")
+    print(f"Grid: {len(candidate_profiles(max_risk=args.max_risk, lean=True))} candidates/strategy (lean, matches the gauntlet) via the shared kernel.\n")
 
     results = []
     for i, strat in enumerate(pending, 1):

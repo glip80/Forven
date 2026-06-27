@@ -1846,10 +1846,15 @@ def _kernel_trigger_markers(strat, frame, *, params, leverage, strategy_type, cu
     if strat is None:
         return entries, exits
     try:
+        # Use the strategy's FROZEN execution profile (stops/TP/trailing/time-stop), the
+        # same one the live paper scan runs, so the chart's trigger triangles reflect the
+        # actual entry/exit logic — a stop/time-stop exit shows where it really fires.
+        # execution_controls=None drew signal-only triggers that diverged from real trades.
+        _trigger_ec = _bt.execution_controls_from_params(params) or None
         res = _bt.run_strategy_execution(
             frame, strat, params=params, warmup=200, leverage=leverage,
             regime_gate=False, trade_mode=_resolve_trigger_trade_mode(strat, params),
-            execution_controls=None, strategy_type=strategy_type,
+            execution_controls=_trigger_ec, strategy_type=strategy_type,
         )
     except Exception:
         return entries, exits
