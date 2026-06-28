@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import traceback
 from collections.abc import Awaitable, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -671,6 +672,24 @@ app.include_router(strategy_guard_router)
 app.include_router(skills_router)
 app.include_router(health_router)
 app.include_router(mcp_router)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Log every unhandled 500 with full traceback + request context."""
+    log.error(
+        "Unhandled 500 on %s %s (client=%s)\n%s\nHeaders: %s",
+        request.method,
+        request.url.path,
+        request.client.host if request.client else "?",
+        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        dict(request.headers),
+    )
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+    )
 
 
 @app.post("/api/shutdown", status_code=202)

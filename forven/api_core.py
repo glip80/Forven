@@ -440,7 +440,7 @@ _AGENT_MODEL_CATALOG = [
     {"provider": "minimax", "model_id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
     {"provider": "minimax", "model_id": "MiniMax-M2.1-highspeed", "label": "MiniMax M2.1 Highspeed"},
     {"provider": "minimax", "model_id": "MiniMax-M2", "label": "MiniMax M2"},
-    {"provider": "lmstudio", "model_id": "local-model", "label": "LM Studio Local Model"},
+    {"provider": "lmstudio", "model_id": "google/gemma-4-26b-a4b", "label": "LM Studio Local Model"},
     {"provider": "zai", "model_id": "glm-5.1", "label": "Z.AI GLM-5.1"},
     {"provider": "zai", "model_id": "glm-5", "label": "Z.AI GLM-5"},
     {"provider": "zai", "model_id": "glm-5-turbo", "label": "Z.AI GLM-5 Turbo"},
@@ -2338,8 +2338,26 @@ def _apply_settings_section(section: str, payload: dict) -> dict:
     secrets = _load_settings_secrets()
 
     section = str(section or "").strip().lower()
-    if section in {"pipeline", "api-keys", "test-discord", "reset"}:
+    if section in {"pipeline", "test-discord", "reset"}:
         raise HTTPException(status_code=404, detail=f"settings section not supported: {section}")
+
+    if section == "api-keys":
+        store = _load_api_keys_payload()
+        for source_key, raw_value in payload.items():
+            source = _normalize_api_key_source(str(source_key).strip())
+            api_key = str(raw_value or "").strip()
+            if not source or not api_key:
+                continue
+            record = store.get(source) if isinstance(store.get(source), dict) else {}
+            record = record if isinstance(record, dict) else {}
+            record.update({
+                "value": api_key,
+                "last_tested": None,
+                "test_status": None,
+            })
+            store[source] = record
+        _save_api_keys_payload(store)
+        return {"status": "ok"}
 
     if section == "exchange":
         exchange = str(payload.get("exchange", "")).strip().lower()

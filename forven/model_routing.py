@@ -107,7 +107,7 @@ _DEFAULT_MODEL_ROUTING = {
     "default_models": {
         "openai": "gpt-5.2",
         "minimax": "MiniMax-M2.5",
-        "lmstudio": "local-model",
+        "lmstudio": "google/gemma-4-26b-a4b",
         "zai": "glm-5.1",
         "openrouter": "openai/gpt-4o-mini",
         "anthropic": "claude-sonnet-4-6",
@@ -136,7 +136,7 @@ _DEFAULT_MODEL_ROUTING = {
             {"provider": "minimax", "model_id": "MiniMax-M2.5"},
         ],
         "lmstudio": [
-            {"provider": "lmstudio", "model_id": "local-model"},
+            {"provider": "lmstudio", "model_id": "google/gemma-4-26b-a4b"},
         ],
         "zai": [
             {"provider": "zai", "model_id": "glm-5.1"},

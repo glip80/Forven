@@ -28,7 +28,6 @@
 	import OpenCodeGoReferralNote from '$lib/components/OpenCodeGoReferralNote.svelte';
 	import { msToMinutes, minutesToMs, formatIntervalMs } from '$lib/utils/schedule';
 
-	export let settings: Record<string, unknown> = {};
 	export let variant: 'default' | 'wizard' = 'default';
 
 	let agents: ForvenAgent[] = [];

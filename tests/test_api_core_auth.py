@@ -241,7 +241,7 @@ def test_lmstudio_tool_provider_omits_auth_header_without_token(monkeypatch):
 
     result = asyncio.run(
         providers.get_provider("lmstudio").call(
-            "local-model",
+            "google/gemma-4-26b-a4b",
             [{"role": "user", "content": "hello"}],
             "",
             [],

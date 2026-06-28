@@ -56,7 +56,7 @@ _PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("zai", "glm-5"): (1.00, 3.00),
     ("zai", "glm-5.1"): (1.00, 3.00),
     # ---- LM Studio (local — free) ----
-    ("lmstudio", "local-model"): (0.00, 0.00),
+    ("lmstudio", "google/gemma-4-26b-a4b"): (0.00, 0.00),
 }
 
 

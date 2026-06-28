@@ -6,6 +6,11 @@ fi
 
 set -euo pipefail
 
+if ! command -v uv &>/dev/null; then
+	echo "[start_all][error] 'uv' not found. Install via: curl -LsSf https://astral.sh/uv/install.sh | sh"
+	exit 1
+fi
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 cd "$DIR"
 
@@ -40,6 +45,8 @@ TMP_DIR="$DIR/.tmp"
 LOG_DIR="$TMP_DIR/logs"
 
 mkdir -p "$TMP_DIR" "$LOG_DIR"
+
+echo "[start_all] Logs will be written to: $LOG_DIR"
 
 BACKEND_LOG="$LOG_DIR/unified_backend.log"
 FRONTEND_LOG="$LOG_DIR/unified_frontend.log"
@@ -112,7 +119,7 @@ wait_for_http_any() {
 }
 
 module_available() {
-	python3 -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)' "$1"
+	uv run python3 -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)' "$1"
 }
 
 kill_port_listener() {
@@ -181,7 +188,7 @@ kill_stale_bot() {
 }
 
 get_lab_worker_status_line() {
-	python3 -c 'from forven.lab_worker_service import get_lab_worker_status; s = get_lab_worker_status(); w = s.get("worker") or {}; print(f"{1 if s.get(\"active\") else 0}|{w.get(\"pid\") or \"\"}")' 2>/dev/null || true
+	uv run python3 -c 'from forven.lab_worker_service import get_lab_worker_status; s = get_lab_worker_status(); w = s.get("worker") or {}; print(f"{1 if s.get(\"active\") else 0}|{w.get(\"pid\") or \"\"}")' 2>/dev/null || true
 }
 
 kill_stale_lab_worker() {
@@ -227,17 +234,17 @@ fi
 # yt-dlp, ...) is caught HERE at boot instead of mid-operation. Self-heal once,
 # then re-verify and fail loudly if still unsatisfied.
 info "Verifying declared Python dependencies..."
-if ! python3 -m forven.preflight; then
-	warn "Dependency preflight reported gaps; attempting 'pip install -e .'"
-	if ! python3 -m pip install -e . ; then
-		die "pip install -e . failed; resolve dependencies and retry."
+if ! uv run -m forven.preflight; then
+	warn "Dependency preflight reported gaps; attempting 'uv pip install -e .'"
+	if ! uv pip install -e . ; then
+		die "uv pip install -e . failed; resolve dependencies and retry."
 	fi
-	if ! python3 -m forven.preflight; then
+	if ! uv run -m forven.preflight; then
 		die "Backend dependencies still unsatisfied after install (see preflight output)."
 	fi
 fi
 
-python3 -m uvicorn --app-dir "$UVICORN_APP_DIR" "$BACKEND_MODULE" --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers "$BACKEND_WORKERS" > "$BACKEND_LOG" 2>&1 &
+uv run uvicorn --app-dir "$UVICORN_APP_DIR" "$BACKEND_MODULE" --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers "$BACKEND_WORKERS" > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 PIDS+=("$BACKEND_PID")
 
@@ -255,7 +262,7 @@ if [[ "$START_BOT" == "1" ]]; then
 	if ! module_available "$BOT_MODULE"; then
 		die "Required bot module not found: ${BOT_MODULE}"
 	fi
-	python3 -c "from forven.bot import run_bot; run_bot()" > "$BOT_LOG" 2>&1 &
+	uv run python3 -c "from forven.bot import run_bot; run_bot()" > "$BOT_LOG" 2>&1 &
 	BOT_PID=$!
 	PIDS+=("$BOT_PID")
 	sleep 1
@@ -278,7 +285,7 @@ if [[ "$START_LAB_WORKER" == "1" ]]; then
 			sleep 1
 		fi
 		info "Starting Regime Lab worker..."
-		python3 -m forven lab worker > "$LAB_WORKER_LOG" 2>&1 &
+		uv run -m forven lab worker > "$LAB_WORKER_LOG" 2>&1 &
 		LAB_WORKER_PID=$!
 		PIDS+=("$LAB_WORKER_PID")
 		sleep 2
@@ -297,7 +304,7 @@ if [[ "$START_DAEMON" == "1" ]]; then
 	if ! module_available "$DAEMON_MODULE"; then
 		die "Required daemon module not found: ${DAEMON_MODULE}"
 	fi
-	python3 -m "$DAEMON_MODULE" daemon start > "$DAEMON_LOG" 2>&1 &
+	uv run -m "$DAEMON_MODULE" daemon start > "$DAEMON_LOG" 2>&1 &
 	DAEMON_PID=$!
 	PIDS+=("$DAEMON_PID")
 	sleep 2
@@ -346,7 +353,7 @@ while true; do
 		info "Self-update restart requested - bouncing backend to load new code..."
 		rm -f "$DIR/.tmp/restart.request" 2>/dev/null || true
 		kill_port_listener "$BACKEND_PORT"
-		python3 -m uvicorn --app-dir "$UVICORN_APP_DIR" "$BACKEND_MODULE" --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers "$BACKEND_WORKERS" > "$BACKEND_LOG" 2>&1 &
+		uv run uvicorn --app-dir "$UVICORN_APP_DIR" "$BACKEND_MODULE" --host "$BACKEND_HOST" --port "$BACKEND_PORT" --workers "$BACKEND_WORKERS" > "$BACKEND_LOG" 2>&1 &
 		BACKEND_PID=$!
 		PIDS+=("$BACKEND_PID")
 		if wait_for_http "$BACKEND_HEALTH_URL" "Backend"; then
