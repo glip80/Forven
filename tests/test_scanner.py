@@ -247,6 +247,114 @@ def test_manage_positions_closes_on_take_profit_without_exit_signal(monkeypatch)
     assert any("take_profit" in action for action in actions)
 
 
+def test_manage_positions_closes_short_on_directional_exit_without_exit_signal(monkeypatch):
+    """Regression: strategies whose real exit lives ONLY in generate_signals
+    (scalar Signal.exit_signal hardcoded False) must still close on their
+    vectorized short_exit. Without this the legacy engine never closes them on
+    strategy logic, so a live short rides until a resting stop or the kill switch
+    while the backtest/kernel exits cleanly — the backtest-vs-live divergence."""
+    open_trade = {
+        "id": "t-dir-short",
+        "asset": "APT",
+        "direction": "short",
+        "entry_price": 0.60,
+        "size": 100.0,
+        "risk_pct": 0.01,
+        "leverage": 1.0,
+    }
+    closed = {}
+    executed = {}
+
+    monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [open_trade])
+    monkeypatch.setattr(
+        scanner_mod,
+        "_execute_direct",
+        lambda **kwargs: executed.update(kwargs) or {"status": "ok"},
+    )
+    monkeypatch.setattr(scanner_mod, "release", lambda _trade_id: None)
+    monkeypatch.setattr(scanner_mod, "log_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scanner_mod,
+        "_close_trade_db",
+        lambda trade_id, exit_price, pnl_pct, pnl_usd, close_reason=None: closed.update(
+            {"trade_id": trade_id, "exit_price": exit_price, "close_reason": close_reason}
+        ),
+    )
+    monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
+
+    actions = manage_positions(
+        "S-DIR-SHORT",
+        # No stop_loss_pct/take_profit_pct -> no risk exit; the close must come
+        # purely from the strategy's vectorized short_exit.
+        {"asset": "APT", "params": {"risk_pct": 0.01, "leverage": 1.0}},
+        {
+            "price": 0.59,
+            "entry_signal": False,
+            "exit_signal": False,  # scalar exit hardcoded False (the bug condition)
+            "direction": "short",
+            "directional_signals": {
+                "long_entry": False,
+                "short_entry": False,
+                "long_exit": False,
+                "short_exit": True,  # the real exit, from generate_signals
+            },
+        },
+        account_equity=10_000.0,
+    )
+
+    assert closed.get("trade_id") == "t-dir-short"
+    assert closed.get("close_reason") == "signal"
+    assert executed.get("action") == "close"
+    assert any("APT" in str(action) for action in actions)
+
+
+def test_manage_positions_holds_when_directional_exit_is_for_other_side(monkeypatch):
+    """The directional exit must match the side actually held: a short_exit must
+    NOT close a LONG position."""
+    open_trade = {
+        "id": "t-dir-long",
+        "asset": "APT",
+        "direction": "long",
+        "entry_price": 0.60,
+        "size": 100.0,
+        "risk_pct": 0.01,
+        "leverage": 1.0,
+    }
+    closed = {"called": False}
+
+    monkeypatch.setattr(scanner_mod, "_get_open_trades", lambda _sid: [open_trade])
+    monkeypatch.setattr(scanner_mod, "_execute_direct", lambda **_kwargs: {"status": "ok"})
+    monkeypatch.setattr(scanner_mod, "release", lambda _trade_id: None)
+    monkeypatch.setattr(scanner_mod, "log_activity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scanner_mod,
+        "_close_trade_db",
+        lambda *_args, **_kwargs: closed.update({"called": True}),
+    )
+    monkeypatch.setattr("forven.config.get_execution_mode", lambda: "paper")
+
+    actions = manage_positions(
+        "S-DIR-LONG",
+        {"asset": "APT", "params": {"risk_pct": 0.01, "leverage": 1.0}},
+        {
+            "price": 0.601,
+            "entry_signal": False,
+            "exit_signal": False,
+            "direction": "long",
+            "directional_signals": {
+                "long_entry": False,
+                "short_entry": False,
+                "long_exit": False,  # long side says HOLD
+                "short_exit": True,  # short-side exit is irrelevant to a long
+            },
+        },
+        account_equity=10_000.0,
+    )
+
+    assert closed.get("called") is False
+    assert not any(str(action).startswith("CLOSED APT") for action in actions)
+
+
 def test_manage_positions_leaves_trade_open_when_close_execution_fails(monkeypatch):
     open_trade = {
         "id": "t-close-fail-1",

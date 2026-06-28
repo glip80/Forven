@@ -4063,6 +4063,19 @@ def manage_positions(
         signed = 1.0 if trade_direction != "short" else -1.0
         reversal_requested = bool(signal.get("entry_signal")) and trade_direction != direction
 
+        # Honor the strategy's VECTORIZED exit for the side we actually hold. Many custom
+        # strategies put their real exit logic (ATR trailing stop, EMA/trend flips) ONLY in
+        # generate_signals and hardcode the scalar Signal.exit_signal to False. Without this
+        # the legacy engine would never close them on strategy logic, leaving a live position
+        # to ride until a resting stop or the kill switch (the backtest/kernel exits cleanly,
+        # so live diverged from the test). The kernel path already executes off these signals.
+        strategy_exit = bool(signal.get("exit_signal"))
+        _dir_sig = signal.get("directional_signals")
+        if isinstance(_dir_sig, dict):
+            _side_exit_key = "short_exit" if trade_direction == "short" else "long_exit"
+            if bool(_dir_sig.get(_side_exit_key)):
+                strategy_exit = True
+
         risk_reason = _risk_exit_reason(
             current_price=exit_price,
             entry_price=float(entry_price),
@@ -4085,7 +4098,7 @@ def manage_positions(
                 continue
             reversal_requested = False
             risk_reason = manual_exit_reason
-        elif not signal.get("exit_signal") and risk_reason is None and not reversal_requested:
+        elif not strategy_exit and risk_reason is None and not reversal_requested:
             continue
 
         pnl_pct = ((exit_price - entry_price) / entry_price) * signed * trade_leverage
@@ -4097,8 +4110,8 @@ def manage_positions(
         pnl_usd = account_equity * trade_risk_pct * abs(pnl_pct)
         exit_reason = (
             "reversal"
-            if reversal_requested and not signal.get("exit_signal")
-            else ("signal" if signal.get("exit_signal") else risk_reason or "signal")
+            if reversal_requested and not strategy_exit
+            else ("signal" if strategy_exit else risk_reason or "signal")
         )
 
         close_result = _close_via_execution(trade, exit_price, pnl_pct, exit_reason)
