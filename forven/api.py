@@ -24,6 +24,7 @@ from forven.api_security import (
 from forven.async_utils import spawn
 from forven.correlation import CorrelationIdMiddleware, RequestIdLogFilter
 from forven.rate_limiting import install_rate_limiter
+from fastapi.responses import JSONResponse
 from forven.control_plane import (
     ConfirmBody,
     ExecutionModeBody,
@@ -685,7 +686,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         dict(request.headers),
     )
-    from fastapi.responses import JSONResponse
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal Server Error"},

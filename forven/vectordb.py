@@ -301,7 +301,7 @@ def _upsert_subprocess(collection_name: str, ids: list[str], documents: list[str
             metadata={"hnsw:space": "cosine"},
         )
         col.upsert(ids=data["ids"], documents=data["documents"], metadatas=data["metadatas"])
-        print("OK")
+        log.info("Vector upsert OK")
     """)
     try:
         proc = subprocess.run(

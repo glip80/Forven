@@ -113,7 +113,7 @@ class RegimeAdaptiveStrategy(BaseStrategy):
                 data['adx'] = adx_result['ADX_14'] if 'ADX_14' in adx_result.columns else adx_result.iloc[:, 0]
             else:
                 data['adx'] = adx_result
-        except:
+        except Exception:
             # Manual ADX calculation fallback
             high_diff = data['high'].diff()
             low_diff = data['low'].diff()
@@ -149,7 +149,7 @@ class RegimeAdaptiveStrategy(BaseStrategy):
             else:
                 data['supertrend'] = 1
                 data['supertrend_direction'] = data['close']
-        except:
+        except Exception:
             data['supertrend'] = 1
             data['supertrend_direction'] = data['close']
         
@@ -164,7 +164,7 @@ class RegimeAdaptiveStrategy(BaseStrategy):
             import pandas_ta as ta
             rsi_result = ta.rsi(data['close'], length=rsi_length)
             data['rsi'] = rsi_result
-        except:
+        except Exception:
             delta = data['close'].diff()
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
@@ -184,7 +184,7 @@ class RegimeAdaptiveStrategy(BaseStrategy):
             else:
                 data['stoch_k'] = stoch_result
                 data['stoch_d'] = stoch_result.rolling(3).mean()
-        except:
+        except Exception:
             low_min = data['low'].rolling(stoch_period).min()
             high_max = data['high'].rolling(stoch_period).max()
             data['stoch_k'] = 100 * (data['close'] - low_min) / (high_max - low_min)

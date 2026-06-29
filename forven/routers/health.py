@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Query
 
 from forven.health_monitor import get_health_monitor, Severity
+
+log = logging.getLogger("forven.routers.health")
 
 router = APIRouter(tags=["health"])
 
@@ -20,7 +24,7 @@ def get_health_status():
         from forven.db import kv_get
         unavailable = bool(kv_get("forven:health_monitor:unavailable", False))
     except Exception:
-        pass
+        log.warning("Failed to read health monitor unavailable flag", exc_info=True)
 
     monitor = get_health_monitor()
     if monitor is None:
@@ -59,7 +63,7 @@ def get_health_alerts(
         try:
             sev = Severity(severity.lower())
         except ValueError:
-            pass
+            log.warning("Invalid severity filter: %r, returning all alerts", severity)
 
     alerts = monitor.state.get_alerts(severity=sev, limit=limit)
     return {

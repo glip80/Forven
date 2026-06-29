@@ -6827,7 +6827,8 @@ def verify_chroma_persistence(result_id: str) -> tuple[bool, str]:
                 metadata={"hnsw:space": "cosine"},
             )
             result = collection.get(ids=[result_id])
-            print(json.dumps({"persisted": bool(result and result.get("ids") and result_id in result["ids"])}))
+            persisted = bool(result and result.get("ids") and result_id in result["ids"])
+            log.info("Chroma result persisted=%s", persisted)
             """
         )
         proc = subprocess.run(
