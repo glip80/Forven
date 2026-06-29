@@ -8,10 +8,17 @@ Public API:
 - :func:`scan_file`   — read+scan a file from disk
 
 Both return an :class:`AstReport`. `ok` is True iff no findings were
-recorded. Forbidden categories: top-level imports of OS/network/file/
-subprocess/dynamic-exec stdlib modules, dynamic execution constructs
-(`eval`/`exec`/`compile`/`__import__('…')`/`getattr(__builtins__, …)`),
-and size caps (file bytes + line count).
+recorded. Findings cover: imports NOT on the allowlist (the import gate is an
+allowlist of numeric/data libs + pure-computation stdlib + the strategy-facing
+forven API — see :data:`ALLOWED_IMPORTS` / :data:`ALLOWED_FORVEN_PREFIXES`),
+re-export smuggling (`from pandas.io.common import os`) and attribute traversal
+to a dangerous module (`pd…subprocess.run`), dynamic execution constructs
+(`eval`/`exec`/`compile`/`__import__('…')`/`getattr(__builtins__, …)`), and size
+caps (file bytes + line count).
+
+NOT a complete trust boundary by itself — a static scan can never be. It is
+defense-in-depth that shrinks the surface; the real boundary is out-of-process
+execution (Phase 2, see docs/security-hardening-plan.md).
 """
 from __future__ import annotations
 
@@ -24,86 +31,104 @@ from typing import Literal
 MAX_FILE_BYTES: int = 100 * 1024  # 100 KB
 MAX_LINES: int = 1500
 
-FORBIDDEN_IMPORTS: frozenset[str] = frozenset(
+# P1.2 (audit 2026-06-28): the import gate is an ALLOWLIST, not a denylist. A
+# denylist of "dangerous" stdlib is unwinnable — `_winapi`, `http.client`,
+# `pdb.run`, `timeit`, `winreg`, `xmlrpc`, `poplib`, ... each reach code-exec or
+# network and a fresh one ships every Python release. A pure-OHLCV strategy only
+# ever needs numeric/data libraries, pure-computation stdlib, and the
+# strategy-facing forven API; everything else is rejected. (The prior denylist is
+# preserved in git history.)
+ALLOWED_IMPORTS: frozenset[str] = frozenset(
+    {
+        # Numeric / data / TA libraries the strategy corpus is built on.
+        "pandas",
+        "numpy",
+        "pandas_ta",
+        "scipy",
+        "sklearn",
+        # Pure-computation stdlib — none of these expose a filesystem, network,
+        # process, or dynamic-exec primitive.
+        "math",
+        "statistics",
+        "decimal",
+        "fractions",
+        "random",
+        "json",
+        "re",
+        "string",
+        "datetime",
+        "typing",
+        "dataclasses",
+        "abc",
+        "enum",
+        "collections",
+        "itertools",
+        "functools",
+        "warnings",
+        "__future__",
+    }
+)
+
+# The ONLY forven module prefixes an untrusted strategy may import: the strategy
+# base/indicators, the composite/builtin strategies it may compose, the read-only
+# market-data view, the scanner indicator helpers, and the data layer. This
+# EXCLUDES forven.exchange / forven.db / forven.secret_storage / forven.config /
+# forven.auth / forven.brain — which expose orders, the database, and credentials.
+# That is a TIGHTENING: the previous denylist allowed ALL of forven.*. (forven.scanner
+# is still broad; the real containment is Phase 2's out-of-process execution — see
+# docs/security-hardening-plan.md.)
+ALLOWED_FORVEN_PREFIXES: tuple[str, ...] = (
+    "forven.strategies.base",
+    "forven.strategies.indicators",
+    "forven.strategies.sentiment",
+    "forven.strategies.composite",
+    "forven.strategies.builtin",
+    "forven.market_data_view",
+    "forven.scanner",
+    "forven.data",
+    "forven.data_manager",
+    "forven.ta",
+)
+
+# Module names that must never be bound as an imported SYMBOL
+# (`from pandas.io.common import os`) nor reached as an ATTRIBUTE
+# (`pd._config.localization.subprocess.run`) — the two re-export smuggling routes
+# back to os/subprocess through an otherwise-allowed package. Kept deliberately
+# TIGHT so it can never collide with a legitimate submodule of an allowed library
+# (numpy.random, scipy.signal, pandas.io, …): only names that are never such a
+# submodule appear here.
+_TRAVERSAL_BLOCK: frozenset[str] = frozenset(
     {
         "os",
         "subprocess",
         "socket",
-        "requests",
-        "httpx",
-        "aiohttp",
-        "urllib",
-        "urllib2",
-        "urllib3",
-        "ftplib",
-        "smtplib",
-        "telnetlib",
-        "ctypes",
-        "cffi",
-        "multiprocessing",
-        "threading",
-        "asyncio",
-        "concurrent",
-        "pathlib",
-        "shutil",
-        "tempfile",
-        "glob",
-        "fileinput",
-        "pickle",
-        "marshal",
-        "shelve",
-        "dbm",
-        "sqlite3",
-        "zipfile",
-        "tarfile",
-        "importlib",
-        "imp",
-        "pkgutil",
-        "pkg_resources",
-        # Gadget-source stdlib modules: each gives a generated strategy a route
-        # back to the builtins namespace / live objects / dynamic execution even
-        # though it imports cleanly. A pure-OHLCV strategy never needs any of them,
-        # so reaching for one is a strong escape signal (P-S audit 2026-06-22).
+        "sys",
         "builtins",
         "__builtin__",
-        "sys",
-        "gc",
-        "inspect",
-        "io",
-        "codecs",
-        "code",
-        "codeop",
-        "runpy",
-        "pty",
+        "__builtins__",
+        "ctypes",
+        "importlib",
+        "_winapi",
+        "_posixsubprocess",
         "posix",
         "nt",
-        "signal",
-        "mmap",
-        "fcntl",
-        "resource",
-        "webbrowser",
-        "platform",
-        "sysconfig",
-        "site",
-        "ast",
-        "dis",
-        # operator.attrgetter('__globals__')(fn) / operator.methodcaller reach the
-        # gadget chain and dynamic dispatch without a dotted attribute the guard
-        # can see. A pure-OHLCV strategy uses Python's native operators, never the
-        # `operator` module, so block it (P-S audit 2026-06-22).
-        "operator",
-        # Third-party (de)serializers that execute pickled callables on load.
-        "joblib",
-        "dill",
-        "cloudpickle",
-        "yaml",
-        # The `ta` technical-analysis library is permanently blocked at runtime by
-        # the import tripwire in forven/__init__.py. Reject it here too so a
-        # generated strategy that imports it fails fast during validation (and the
-        # codegen retry can fix it) instead of crashing mid-backtest.
-        "ta",
+        "msvcrt",
+        "winreg",
+        "pty",
+        "multiprocessing",
+        "popen",
     }
 )
+
+
+def _module_import_allowed(dotted: str) -> bool:
+    """Allowlist check for a (possibly dotted) module name."""
+    name = (dotted or "").strip()
+    if not name:
+        return False
+    if name.split(".")[0] == "forven":
+        return any(name == p or name.startswith(p + ".") for p in ALLOWED_FORVEN_PREFIXES)
+    return name.split(".")[0] in ALLOWED_IMPORTS
 
 FORBIDDEN_CALLS: frozenset[str] = frozenset(
     {
@@ -151,9 +176,9 @@ FORBIDDEN_ATTRS: frozenset[str] = frozenset(
 # blocked in BOTH bare-name form (``eval(x)``) AND attribute form
 # (``builtins.eval(x)``, ``b.open(...)``) — the attribute form was the verified
 # bypass of the old denylist, which only checked ``ast.Name`` callees. Most of
-# these are builtins reachable without an import, or live on modules already in
-# FORBIDDEN_IMPORTS, so the attribute check is defense-in-depth that closes the
-# "import a not-yet-banned module and reach the same primitive" gadget.
+# these are builtins reachable without an import, or live on modules the import
+# allowlist already blocks, so the attribute check is defense-in-depth that closes
+# the "reach the same primitive off a re-exported module" gadget.
 FORBIDDEN_CALL_ATTRS: frozenset[str] = frozenset(
     {
         "eval",
@@ -190,6 +215,19 @@ FORBIDDEN_CALL_ATTRS: frozenset[str] = frozenset(
         "spawnve",
         "spawnvp",
         "spawnvpe",
+        # Process-spawn / file-launch / env-read names the old list missed —
+        # reachable off a re-exported subprocess/os if the attribute traversal is
+        # somehow bypassed (audit P1.2). `.run`/`.call` are intentionally NOT here
+        # (too generic — a strategy may legitimately define a method named run);
+        # the `.subprocess`/`.os` attribute block is what stops `subprocess.run`.
+        "Popen",
+        "check_output",
+        "check_call",
+        "startfile",
+        "posix_spawn",
+        "posix_spawnp",
+        "getenv",
+        "putenv",
     }
 )
 
@@ -300,14 +338,13 @@ class _GuardVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            top = alias.name.split(".")[0]
-            if top in FORBIDDEN_IMPORTS:
+            if not _module_import_allowed(alias.name):
                 self.findings.append(
                     Finding(
                         kind="forbidden_import",
                         lineno=node.lineno,
                         col=node.col_offset,
-                        message=f"Forbidden import: '{alias.name}'",
+                        message=f"Import not on the allowlist: '{alias.name}'",
                         node_repr=ast.dump(node),
                     )
                 )
@@ -315,17 +352,43 @@ class _GuardVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        top = module.split(".")[0]
-        if top in FORBIDDEN_IMPORTS:
+        if getattr(node, "level", 0):
+            # Relative import — an untrusted strategy module has no package to
+            # reach into; reject so `from . import os` / `from .. import x` can't
+            # smuggle a sibling module past the dotted-name allowlist.
             self.findings.append(
                 Finding(
                     kind="forbidden_import",
                     lineno=node.lineno,
                     col=node.col_offset,
-                    message=f"Forbidden import: 'from {module} import ...'",
+                    message="Relative imports are not allowed",
                     node_repr=ast.dump(node),
                 )
             )
+        elif not _module_import_allowed(module):
+            self.findings.append(
+                Finding(
+                    kind="forbidden_import",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    message=f"Import not on the allowlist: 'from {module} import ...'",
+                    node_repr=ast.dump(node),
+                )
+            )
+        # Smuggle guard: even from an allowed package, refuse to BIND a dangerous
+        # module as a symbol — `from pandas.io.common import os` has an allowed
+        # top package (pandas) but binds the real os module.
+        for alias in node.names:
+            if alias.name.split(".")[0] in _TRAVERSAL_BLOCK:
+                self.findings.append(
+                    Finding(
+                        kind="forbidden_import",
+                        lineno=node.lineno,
+                        col=node.col_offset,
+                        message=f"Forbidden imported symbol: '{alias.name}'",
+                        node_repr=ast.dump(node),
+                    )
+                )
         self.generic_visit(node)
 
     def _add(self, node: ast.AST, message: str) -> None:
@@ -403,18 +466,18 @@ class _GuardVisitor(ast.NodeVisitor):
             )
         elif isinstance(func, ast.Name) and func.id == "__import__":
             # A dynamic import is safe ONLY when its argument is a CONSTANT string
-            # naming a non-forbidden module — that is exactly equivalent to a plain
+            # naming an ALLOWLISTED module — that is exactly equivalent to a plain
             # `import <name>` and is a common codegen idiom (`__import__("pandas")`).
             # A non-constant argument (the real obfuscation/exfil primitive) or a
-            # forbidden module (os/socket/ctypes/…) stays blocked.
+            # non-allowlisted module (os/socket/ctypes/…) stays blocked.
             const_mod: str | None = None
             if (
                 node.args
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
             ):
-                const_mod = node.args[0].value.split(".")[0]
-            if const_mod is None or const_mod in FORBIDDEN_IMPORTS:
+                const_mod = node.args[0].value
+            if const_mod is None or not _module_import_allowed(const_mod):
                 self.findings.append(
                     Finding(
                         kind="dynamic_exec",
@@ -480,6 +543,19 @@ class _GuardVisitor(ast.NodeVisitor):
                     lineno=node.lineno,
                     col=node.col_offset,
                     message=f"Forbidden attribute access: '.{node.attr}'",
+                    node_repr=ast.dump(node),
+                )
+            )
+        elif node.attr in _TRAVERSAL_BLOCK:
+            # Attribute-chain to a dangerous module re-exported off an allowed
+            # package, e.g. `pandas._config.localization.subprocess` — the `.subprocess`
+            # hop is caught here before any `.run(...)` can fire (audit P1.2).
+            self.findings.append(
+                Finding(
+                    kind="dynamic_exec",
+                    lineno=node.lineno,
+                    col=node.col_offset,
+                    message=f"Forbidden module attribute access: '.{node.attr}'",
                     node_repr=ast.dump(node),
                 )
             )

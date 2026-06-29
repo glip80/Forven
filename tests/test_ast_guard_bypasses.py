@@ -43,6 +43,25 @@ BYPASS_PAYLOADS = {
     "dunder_import_alias": "i = __import__\ni('os')\n",
     "import_operator": "import operator\n",
     "operator_attrgetter": "from operator import attrgetter\nattrgetter('__globals__')(print)\n",
+    # P1.2 (audit 2026-06-28): allowlist + traversal/smuggle bypasses that the old
+    # denylist let through and that were proven to execute in-process.
+    "pandas_subprocess_traversal": "import pandas as pd\npd._config.localization.subprocess.run(['echo', 'x'])\n",
+    "pandas_os_traversal": "import pandas as pd\npd.compat.os.startfile('x')\n",
+    "from_pandas_import_os": "from pandas.io.common import os\n_ = os.environ\n",
+    "from_numpy_import_sys": "from numpy import sys\n",
+    "import_winapi": "import _winapi\n",
+    "import_http_client": "import http.client\n",
+    "import_pdb_run": "import pdb\npdb.run('x=1')\n",
+    "import_timeit_exec": "import timeit\ntimeit.timeit('x=1')\n",
+    "import_winreg": "import winreg\n",
+    "import_poplib": "import poplib\n",
+    "relative_import_smuggle": "from . import os\n",
+    # The forven.* tightening: orders / DB / credentials are now off-limits to
+    # untrusted strategy code (the old denylist allowed ALL of forven.*).
+    "forven_exchange_blocked": "from forven.exchange.hyperliquid import market_order\n",
+    "forven_db_blocked": "from forven.db import get_db\n",
+    "forven_secret_blocked": "from forven.secret_storage import decrypt_secret\n",
+    "forven_config_blocked": "import forven.config\n",
 }
 
 LEGIT_PAYLOADS = {
@@ -78,6 +97,17 @@ LEGIT_PAYLOADS = {
     "getattr_constant_ok": "def pick(o):\n    return getattr(o, 'close')\n",
     "setattr_constant_ok": "class S:\n    def f(self):\n        setattr(self, 'cached', 1)\n",
     "builtin_numeric_calls_ok": "def f(x):\n    return int(float(x)) + abs(x) + round(x, 2)\n",
+    # P1.2: the allowlist must NOT regress real corpus patterns — legit submodules
+    # of allowed libraries (numpy.random, scipy.signal, pandas.io), the extra TA/
+    # science libs the corpus uses, and the strategy-facing forven API.
+    "numpy_random_ok": "import numpy as np\ny = np.random.normal(size=3)\n",
+    "scipy_signal_ok": "from scipy import signal\n_ = signal\n",
+    "pandas_io_attr_ok": "import pandas as pd\n_ = pd.io\n",
+    "pandas_ta_ok": "import pandas_ta as pta\n",
+    "warnings_ok": "import warnings\nwarnings.warn('x')\n",
+    "forven_base_ok": "from forven.strategies.base import BaseStrategy, Signal\n",
+    "forven_marketdata_ok": "from forven.market_data_view import get_ohlcv\n",
+    "forven_scanner_helper_ok": "from forven.scanner import compute_atr\n",
 }
 
 

@@ -82,11 +82,29 @@ def test_position_units_conversion():
     assert sizing.position_units(equity=10000, size_fraction=0.0, leverage=1.0, entry_price=100) == 0.0
 
 
-def test_default_is_one_percent_fraction():
+def test_default_is_one_percent_atr_risk():
+    # The default risk engine is 1% risk sized against an auto-synthesized ATR stop
+    # (placed as a real stop), NOT fraction-with-no-stop (which collapsed to 1%
+    # notional = the "$100 on $10k" bug).
     c = sizing.default_controls()
-    assert c["sizing_mode"] == "fraction"
+    assert c["sizing_mode"] == "atr"
+    assert c["needs_atr"] is True
     assert c["risk_per_trade"] == 0.01
+    assert c["atr_stop_multiplier"] == sizing.DEFAULT_ATR_STOP_MULTIPLIER
+    assert c["stop_loss_pct"] == sizing.DEFAULT_STOP_LOSS_PCT_FLOOR  # ATR-unavailable floor
     assert c["is_default"] is True
+
+
+def test_default_synthesizes_atr_stop_distance():
+    # With ATR available the default derives its stop distance from ATR (2x ATR),
+    # so the kernel both risk-sizes AND places a real stop_price.
+    c = sizing.default_controls()
+    entry, atr = 100.0, 1.5
+    dist = sizing.entry_stop_dist_pct(c, entry_price=entry, atr_value=atr)
+    assert dist == pytest.approx((sizing.DEFAULT_ATR_STOP_MULTIPLIER * atr) / entry)
+    # ATR unavailable -> falls back to the fixed-percent floor, never None.
+    floor = sizing.entry_stop_dist_pct(c, entry_price=entry, atr_value=None)
+    assert floor == pytest.approx(sizing.DEFAULT_STOP_LOSS_PCT_FLOOR / 100.0)
 
 
 def test_default_sizing_is_not_piddly():

@@ -1153,11 +1153,18 @@ async def _run_agent_task_inner(
     tool_context_tokens: tuple[Token, ...] | None = None
     try:
         # Set per-task tool context for permission gating and tool audit logging.
-        # Research tasks run in the 'research' context (which denies nothing by
-        # default but binds any per-agent research-context overrides); other
-        # agent task types stay ungated to preserve existing behavior.
+        # Research tasks ingest the most untrusted content → 'research' context
+        # (denies codegen + catastrophic). Code-authoring autonomous tasks need
+        # codegen + research, but a prompt-injected one must never reach a
+        # catastrophic primitive → 'develop' context (denies catastrophic only).
+        # Other task types stay ungated to preserve existing behavior. (audit P1.1)
         task_display_id = str(task.get("display_id") or "").strip()
-        task_tools_context = "research" if task_type == "research" else None
+        if task_type == "research":
+            task_tools_context = "research"
+        elif task_type in {"develop_candidate", "code_strategy"}:
+            task_tools_context = "develop"
+        else:
+            task_tools_context = None
         tool_context_tokens = set_tool_context(
             agent_id,
             task_display_id or format_prefixed_id("T", int(task_id)),

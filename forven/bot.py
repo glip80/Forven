@@ -491,7 +491,10 @@ def get_bot_token() -> str:
     if token:
         return token
     cfg = load_config()
-    token = cfg.get("discord_token")
+    # Stored encrypted by the Settings save path (audit P1.5); decrypt_secret
+    # passes any legacy plaintext token through unchanged for backward compat.
+    from forven.secret_storage import decrypt_secret
+    token = decrypt_secret(cfg.get("discord_token") or "")
     if not token:
         raise ValueError(
             "Discord bot token not found. Set DISCORD_TOKEN env var "
